@@ -2,10 +2,13 @@
 name: trader-broker
 description: >-
   Order Executor. Sends approved orders to your broker, paper trading by
-  default, never without your yes. Shows each order as a plain ticket (a
-  bracket shows its stop-loss, take-profit and the max loss at the stop)
-  plus the exact JSON for Alpaca's place_stock_order, records your yes word
-  for word, then Claude's own Allow once / Deny card asks again. Builds the
+  default, never without your yes. On NSE (the default) the broker is Upstox
+  and every ticket is a PAPER ticket: this tool never places an order, it
+  shows the ticket for the user's yes and the order goes in the Upstox app.
+  On NYSE (via --market us or "broker": "alpaca") it shows each order as a
+  plain ticket plus the exact JSON for Alpaca's place_stock_order. A bracket
+  shows its stop-loss, take-profit and the max loss at the stop. Records your
+  yes word for word, then Claude's own Allow once / Deny card asks again. Builds the
   sell ticket that closes a day trade by your flat-by time, records fills,
   and logs each trade's max loss so trader-risk can hold the daily limit.
   Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
@@ -34,6 +37,7 @@ Two yeses from the user, one PASS from the rules. No yes, no order.
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" show                     # every ticket, READY or not
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" quote RELIANCE           # live Upstox quote, Yahoo fallback
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" approve --index 1 --reply "yes"
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" result --index 1 --status placed --broker-id ID --filled-qty 8 --filled-price 364.20
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" fill --symbol TSLA --side sell --qty 8 --price 370.04
@@ -41,9 +45,35 @@ python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol TSLA --qty 8
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
 ```
 
-`ticket.py` never talks to a broker. It renders tickets, checks that a reply
+`ticket.py` never talks to a broker to place anything. It renders tickets, checks that a reply
 is a real yes for that order, builds the flatten ticket, and keeps the log in
-`trader/state/broker.json`. `--now "2026-10-19 10:15"` pins the clock (New York time).
+`trader/state/broker.json`. `--now "2026-10-19 10:15"` pins the clock (market time: IST on NSE,
+New York time with `--market us`).
+
+## NSE by default: Upstox paper tickets
+
+NSE is the default (`--market us` restores NYSE/Alpaca). On NSE the broker is
+Upstox, set with `"broker": "upstox"` in `trader/config.json` (see
+`trader-budget/config-nse.example.json`), and every ticket is a PAPER ticket:
+
+- `ticket.py show` renders the order in rupees with the stop-loss,
+  take-profit and max loss at the stop, and says plainly that nothing is
+  placed by this tool. After the user's explicit yes, the order is placed in
+  the Upstox app, then recorded with `ticket.py result`.
+- `ticket.py quote RELIANCE` reads a live quote through the read-only Upstox
+  API helper (`~/workspace/custom-connectors/custom.upstox/bin/upstox.py
+  quote`), one instrument key per call. Verified keys: RELIANCE
+  `NSE_EQ|INE002A01018`, COALINDIA `NSE_EQ|INE522F01014`, JPL
+  `NSE_EQ|INE0BJO01010`. Any other symbol needs `--key NSE_EQ|<ISIN>`.
+- The Upstox access token expires daily at 3:30 AM IST: a 401 means the user
+  must re-authorise Upstox. If the quote call fails for any reason (a 401, a
+  timeout), the ticket falls back to a delayed Yahoo quote for the `.NS`
+  ticker and says so plainly.
+- Order placement through the Upstox API is untested and is not attempted:
+  the ticket is only ever a shown order awaiting the user's explicit yes.
+  Alpaca stays reachable with `--market us` and `"broker": "alpaca"`.
+- Amounts are rupees, the session is 9:15 a.m. to 3:30 p.m. IST, flat by
+  15:15 IST by default. There is no pattern-day-trader rule in India.
 
 ## What it reads and writes
 
@@ -145,8 +175,11 @@ that draft orders to Needs approval too.
    If it prints "Not recorded", the reply was not an explicit yes for this
    order (for example "sure", "yes to all", or a yes that names a different
    stock or amount). Ask again. Never turn a reply into a yes yourself.
-4. Only after "Recorded your yes", call `place_stock_order` with exactly the
-   JSON the ticket printed. Claude's card appears: Allow once or Deny.
+4. Only after "Recorded your yes":
+   - Alpaca: call `place_stock_order` with exactly the JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   - Upstox (NSE): nothing is placed by this tool. Place the order in the
+     Upstox app with exactly the ticket above, then record it with `ticket.py
+     result` (step 5). Never place it from a scheduled or background task.
 5. Record what happened: `ticket.py result --index N --status placed
    --broker-id <id> --filled-qty Q --filled-price P` (the fill from the
    response or `get_open_position`), or `--status denied`, or `--status failed`
@@ -159,8 +192,9 @@ that draft orders to Needs approval too.
   (`alerts.py add --from-plan`). The bracket's own orders do the stopping.
 - When the stop-loss or the take-profit fills, record it:
   `ticket.py fill --symbol TSLA --side sell --qty 8 --price 358.32`.
-- By `flat_by` (15:55 New York), anything still open gets closed:
+- By `flat_by` (15:55 New York, 15:15 IST on NSE), anything still open gets closed:
   1. Ask Alpaca how many shares are held: `get_open_position` (read only).
+     On NSE, check Upstox positions (`upstox.py positions`, read only).
   2. `ticket.py flatten --symbol TSLA --qty 8` writes a market sell for those
      shares to `trader/orders.json`.
   3. `/trader-risk`. A sell that only closes what the user holds is never
@@ -191,9 +225,30 @@ card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
 
+## Example: RELIANCE on NSE (verified live 2026-11-11)
+
+```
+ORDER 1 of 1, PAPER account, Upstox
+  BUY 280 RELIANCE, market, good for today
+  stop-loss 1320.00
+  take-profit 1350.80
+  max loss about ₹4,312 if the stop fills at 1320.00 (it can fill worse in a fast market)
+  why: opening-range breakout on RELIANCE: 280 shares, bound by your position cap (280 x 15.40 = ₹4,312 at the stop)
+  READY: trader-risk PASS, waiting for your yes
+  Upstox PAPER ticket: this tool never places an order. The ticket above is what
+  you approve; it is placed in the Upstox app only after your explicit yes.
+```
+
+The live quote that day: Upstox timed out, so `ticket.py quote RELIANCE`
+fell back to Yahoo and said so, giving ₹1,335.40 (the Nov 11 close). The
+user replies "yes", the order is placed in the Upstox app, then `ticket.py
+result --index 1 --status placed` records it.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.
+- On NSE it never places an order at all: the Upstox ticket is shown for the
+  user's yes and placed in the Upstox app, never by this tool.
 - Never places orders from a scheduled or background task: nobody is there to say yes.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.

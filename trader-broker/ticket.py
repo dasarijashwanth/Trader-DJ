@@ -30,7 +30,12 @@ work around the one moment that matters, your yes:
     python3 ticket.py log
 
 Everything is written to trader/state/broker.json (append only). Dates are
-New York dates; --now "2026-10-19 10:15" pins the clock.
+market dates (IST for NSE, New York for NYSE); --now "2026-10-19 10:15" pins
+the clock. NSE is the default (--market us for NYSE); on NSE the broker is
+Upstox and every ticket is a PAPER ticket: this tool never places an order.
+`ticket.py quote RELIANCE` reads a live Upstox quote (read only; a 401 means
+the token expired at 3:30 AM IST) and falls back to a delayed Yahoo quote,
+saying so plainly.
 """
 
 import argparse
@@ -39,7 +44,18 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import urllib.parse
+import urllib.request
+
+UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/Jakeschincariol/day-trader-skill)"
+UPSTOX_HELPER = os.path.join(os.path.expanduser("~"), "workspace", "custom-connectors",
+                             "custom.upstox", "bin", "upstox.py")
+# Verified Upstox instrument keys (NSE_EQ|<ISIN>). A wrong ISIN returns a different
+# stock, so the quote checks the symbol in the answer before trusting the price.
+UPSTOX_KEYS = {"RELIANCE": "NSE_EQ|INE002A01018", "COALINDIA": "NSE_EQ|INE522F01014",
+               "JPL": "NSE_EQ|INE0BJO01010"}
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -59,7 +75,110 @@ class TicketError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time (New York, no tz files)
+# ---------------------------------------------------------------- market (NSE first at the CLI; --market us restores NYSE)
+# The module default is "us": the original NYSE behaviour, so direct callers
+# and the offline tests see exactly what they saw before. main() sets the
+# market from --market (default nse) or trader/config.json "market".
+MARKET = "us"
+
+NYSE_HOLIDAYS = {
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King, Jr. Day",
+    "2026-02-16": "Washington's Birthday",
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",
+    "2026-06-19": "Juneteenth National Independence Day",
+    "2026-07-03": "Independence Day (observed)",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving Day",
+    "2026-12-25": "Christmas Day",
+    "2027-01-01": "New Year's Day",
+    "2027-01-18": "Martin Luther King, Jr. Day",
+    "2027-02-15": "Washington's Birthday",
+    "2027-03-26": "Good Friday",
+    "2027-05-31": "Memorial Day",
+    "2027-06-18": "Juneteenth National Independence Day (observed)",
+    "2027-07-05": "Independence Day (observed)",
+    "2027-09-06": "Labor Day",
+    "2027-11-25": "Thanksgiving Day",
+    "2027-12-24": "Christmas Day (observed)",
+}
+NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
+    "2026-11-27": "day after Thanksgiving",
+    "2026-12-24": "Christmas Eve",
+    "2027-11-26": "day after Thanksgiving",
+}
+
+NSE_HOLIDAYS = {  # NSE capital-market holidays 2026, from NSE holiday-master (CM segment).
+    "2026-01-15": "Municipal Corporation Election - Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-02-15": "Mahashivratri",
+    "2026-03-03": "Holi",
+    "2026-03-21": "Id-Ul-Fitr (Ramadan Eid)",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-08-15": "Independence Day",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-08": "Diwali Laxmi Pujan",
+    "2026-11-10": "Diwali-Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# NSE has no 1:00 p.m. early closes. Diwali's Muhurat session is a separate
+# evening session (about an hour, announced by circular); these tools treat
+# that day as closed for the day session. NSE's 2027 holidays are not
+# published yet (expected December 2026): years outside the list above are
+# treated as open on weekdays, so confirm them on nseindia.com.
+NSE_EARLY_CLOSE = {}
+
+MARKETS = {
+    "nse": {"tz": "IST", "open": datetime.time(9, 15), "close": datetime.time(15, 30),
+            "early": None, "holidays": NSE_HOLIDAYS, "early_close": NSE_EARLY_CLOSE,
+            "currency": "\u20b9", "exchange": "NSE", "bars_per_day": 75},
+    "us": {"tz": "ET", "open": datetime.time(9, 30), "close": datetime.time(16, 0),
+           "early": datetime.time(13, 0), "holidays": NYSE_HOLIDAYS, "early_close": NYSE_EARLY_CLOSE,
+           "currency": "$", "exchange": "NYSE", "bars_per_day": 78},
+}
+
+
+def set_market(name):
+    """Switch the active market: 'nse' or 'us'. Raises TicketError otherwise."""
+    global MARKET
+    name = (name or "nse").lower()
+    if name not in MARKETS:
+        raise TicketError("--market wants nse or us, got %r" % name)
+    MARKET = name
+
+
+def mkt():
+    return MARKETS[MARKET]
+
+
+def tz_label():
+    return mkt()["tz"]
+
+
+def tz_name():
+    """The prose name of the market's time zone: 'New York' for NYSE, 'IST' for NSE."""
+    return "New York" if MARKET == "us" else "IST"
+
+
+def resolve_market(args, cfg=None):
+    """CLI/config market selection: --market wins, then trader/config.json
+    'market', then nse. Call before any market-aware work."""
+    name = getattr(args, "market", None)
+    if not name and cfg:
+        name = cfg.get("market")
+    set_market(name or "nse")
+
+# ---------------------------------------------------------------- time (market time, no tz files)
 
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
@@ -78,11 +197,28 @@ def eastern_offset(utc):
     return -4 if start <= naive < end else -5
 
 
+def market_offset(utc):
+    """Hours from UTC for the active market. IST is +5:30 all year (no DST);
+    New York is -4 in daylight time, -5 otherwise."""
+    if MARKET == "nse":
+        return 5.5
+    return eastern_offset(utc)
+
+
 def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+    """Naive UTC -> naive market wall-clock time. Kept the old name for the
+    offline tests; it follows the active market (IST for NSE, ET for NYSE)."""
+    return utc.replace(tzinfo=None) + datetime.timedelta(hours=market_offset(utc))
+
+
+def to_local(utc):
+    return to_eastern(utc)
 
 
 def eastern_to_utc(local):
+    """Naive market wall-clock time -> naive UTC."""
+    if MARKET == "nse":
+        return local - datetime.timedelta(hours=5, minutes=30)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -90,24 +226,115 @@ def eastern_to_utc(local):
     return local + datetime.timedelta(hours=5)
 
 
+def local_to_utc(local):
+    return eastern_to_utc(local)
+
+
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as market time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % tz_label())
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
 def ny_iso(now_utc):
-    """naive UTC -> "2026-10-19T10:15:00-04:00" (New York wall clock with its offset)."""
-    off = eastern_offset(now_utc)
-    return "%s%+03d:00" % (to_eastern(now_utc).replace(microsecond=0).isoformat(), off)
+    """naive UTC -> "2026-10-19T10:15:00-04:00" (market wall clock with its offset).
+    Kept the old name for the log; it follows the active market (IST for NSE)."""
+    off = market_offset(now_utc)
+    sign = "+" if off >= 0 else "-"
+    hh, mm = divmod(abs(off) * 60, 60)
+    return "%s%s%02d:%02d" % (to_eastern(now_utc).replace(microsecond=0).isoformat(),
+                              sign, int(hh), int(mm))
+
+
+def market_iso(now_utc):
+    return ny_iso(now_utc)
+
+
+def to_yahoo(sym):
+    """Our symbol -> the Yahoo symbol. NSE: a bare symbol gets .NS, and a
+    symbol that already ends .NS or .BO passes through (M&M -> M&M.NS).
+    US: BRK.B -> BRK-B, as Yahoo wants it."""
+    s = sym.upper()
+    if MARKET == "nse":
+        if s.endswith(".NS") or s.endswith(".BO"):
+            return s
+        return s + ".NS"
+    return s.replace(".", "-")
+
+
+def yahoo_quote(sym):
+    """A delayed Yahoo quote: {"symbol", "price", "prev_close", "time", "source": "yahoo"}."""
+    url = "https://query2.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=1d" % (
+        urllib.parse.quote(to_yahoo(sym), safe=""))
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            doc = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise TicketError("Yahoo answered HTTP %d for %s" % (e.code, sym))
+    except (urllib.error.URLError, OSError) as e:
+        raise TicketError("could not reach Yahoo: %s" % getattr(e, "reason", e))
+    try:
+        res = doc["chart"]["result"]
+    except (KeyError, TypeError):
+        raise TicketError("Yahoo returned something unexpected for %s" % sym)
+    if not res:
+        err = (doc.get("chart") or {}).get("error") or {}
+        raise TicketError("Yahoo has no data for %s: %s" % (sym, err.get("description", "unknown ticker")))
+    m = res[0].get("meta", {})
+    price = m.get("regularMarketPrice")
+    if price is None:
+        raise TicketError("Yahoo has no price for %s" % sym)
+    t = m.get("regularMarketTime")
+    when = (datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if t else "")
+    return {"symbol": sym.upper(), "price": float(price), "prev_close": m.get("previousClose"),
+            "time": when, "source": "yahoo"}
+
+
+def upstox_quote(sym, key=None):
+    """A live Upstox quote via the read-only helper (quote only, never an order).
+    Raises TicketError on any failure: a 401 means the access token expired at
+    3:30 AM IST and the user must re-authorise Upstox."""
+    key = key or UPSTOX_KEYS.get(sym.upper())
+    if not key:
+        raise TicketError("no Upstox instrument key for %s: pass --key NSE_EQ|<ISIN>" % sym.upper())
+    try:
+        out = subprocess.run([sys.executable, UPSTOX_HELPER, "quote", "--key", key],
+                             capture_output=True, text=True, timeout=75)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise TicketError("Upstox helper failed: %s" % e)
+    try:
+        doc = json.loads(out.stdout)
+    except ValueError:
+        # The helper prints a traceback on a network failure: the last line
+        # is the reason (e.g. "urllib.error.URLError: <urlopen error timed out>").
+        err_text = out.stderr.strip() or out.stdout.strip()
+        tail = (err_text.splitlines() or [""])[-1][:160]
+        raise TicketError("Upstox helper failed: %s" % (tail or "no output"))
+    data = (doc or {}).get("data") or {}
+    entry = None
+    for v in data.values():
+        if isinstance(v, dict) and str(v.get("symbol") or v.get("tradingsymbol") or "").upper() == sym.upper():
+            entry = v
+            break
+    if entry is None and len(data) == 1:
+        entry = next(iter(data.values()))
+    if not isinstance(entry, dict) or entry.get("last_price") is None:
+        err = (doc.get("errors") or [{}])[0] if isinstance(doc.get("errors"), list) else {}
+        raise TicketError("Upstox quote failed: %s" % (err.get("message") or doc.get("status")
+                                                      or "no last_price"))
+    return {"symbol": sym.upper(), "price": float(entry["last_price"]),
+            "prev_close": (entry.get("ohlc") or {}).get("close"),
+            "time": "", "source": "upstox", "instrument_key": key}
 
 
 # ---------------------------------------------------------------- files
@@ -179,7 +406,12 @@ def tool_input(order):
 def _money(v):
     f = float(v)
     s = "{:,.2f}".format(f)
-    return "$" + (s[:-3] if s.endswith(".00") else s)
+    return mkt()["currency"] + (s[:-3] if s.endswith(".00") else s)
+
+
+def broker_name(cfg):
+    """The broker for these tickets: the config's, else upstox on NSE, alpaca on NYSE."""
+    return str(cfg.get("broker") or ("upstox" if MARKET == "nse" else "alpaca")).lower()
 
 
 def _p(v):
@@ -351,10 +583,11 @@ def kind_of(order, rv):
 
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_name(cfg)
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    names = {"ibkr": "Interactive Brokers", "upstox": "Upstox", "alpaca": "Alpaca"}
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, names.get(broker, broker))]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -365,6 +598,15 @@ def render(order, idx, total, cfg, risk, state, today):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    elif broker == "upstox":
+        lines.append("  Upstox PAPER ticket: this tool never places an order. The ticket above is what")
+        lines.append("  you approve; it is placed in the Upstox app only after your explicit yes.")
+        lines.append("  The order, for reference (the same fields trader-budget wrote):")
+        for l in json.dumps(tool_input(order), indent=2).splitlines():
+            lines.append("    " + l)
+        if is_bracket(order):
+            lines.append("  Upstox places the entry, then the stop-loss and the take-profit as two orders")
+            lines.append("  that cancel each other: when one fills, the other is canceled.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -373,8 +615,9 @@ def render(order, idx, total, cfg, risk, state, today):
             lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
             lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
-        lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
-        if broker != "ibkr":
+        lines.append("  Reply \"yes\" to %s this one order, or \"no\" to skip it."
+                     % ("approve" if broker == "upstox" else "place"))
+        if broker == "alpaca":
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
     return "\n".join(lines), ready
 
@@ -382,9 +625,12 @@ def render(order, idx, total, cfg, risk, state, today):
 def ticket_json(order, idx, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
+    broker = broker_name(cfg)
+    tools = {"alpaca": "place_stock_order", "ibkr": "ibkr draft",
+             "upstox": "upstox paper ticket (no order placed)"}
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": broker, "tool": tools.get(broker, "paper ticket (no order placed)"),
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -465,6 +711,7 @@ def _load(a):
     if not isinstance(orders, list) or not orders:
         raise TicketError("no orders in %s" % a.orders)
     cfg = read_json(a.config, "config", required=False) or {}
+    resolve_market(a, cfg)
     risk = read_json(a.risk, "risk check", required=False)
     state = load_state(a.state)
     now, today = _clock(a)
@@ -512,12 +759,17 @@ def cmd_approve(a):
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)), "broker": broker_name(cfg)}
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    broker = broker_name(cfg)
+    if broker == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    elif broker == "upstox":
+        print("Paper ticket approved. Nothing is placed by this tool: place it in the Upstox app with")
+        print("exactly the ticket above, then: ticket.py result --index %d --status placed|denied|failed"
+              % a.index)
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -571,6 +823,7 @@ def cmd_result(a):
 
 def cmd_fill(a):
     cfg = read_json(a.config, "config", required=False) or {}
+    resolve_market(a, cfg)
     now = parse_now(a.now)
     date = a.date or to_eastern(now).date().isoformat()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
@@ -585,6 +838,7 @@ def cmd_fill(a):
 
 def cmd_flatten(a):
     cfg = read_json(a.config, "config", required=False) or {}
+    resolve_market(a, cfg)
     sym = a.symbol.strip().upper()
     now, today = _clock(a)
     source = "the broker, get_open_position"
@@ -602,10 +856,10 @@ def cmd_flatten(a):
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
+        or cfg.get("flat_by") or ("15:15" if MARKET == "nse" else "15:55")
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+             "why": "flat by %s %s: closes the %s day trade before the close (qty from %s)"
+             % (flat_by, tz_name(), sym, source)}
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -613,18 +867,57 @@ def cmd_flatten(a):
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
+    print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order), flat_by, tz_name()))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
-        print("The qty comes from %s. Check it against get_open_position %s before you say yes." % (source, sym))
+        if broker_name(cfg) == "upstox":
+            print("The qty comes from %s. Check it against your Upstox positions (upstox.py positions) "
+                  "before you say yes." % source)
+        else:
+            print("The qty comes from %s. Check it against get_open_position %s before you say yes."
+                  % (source, sym))
     print("Next:")
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
-    print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
-    print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
-    print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    if broker_name(cfg) == "upstox":
+        print("  3. If the bracket's stop-loss and take-profit are still open, Upstox holds these shares")
+        print("     for them and rejects a new sell. Cancel the open legs in the Upstox app first,")
+        print("     then place this ticket there.")
+    else:
+        print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
+        print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
+        print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    return 0
+
+
+def cmd_quote(a):
+    """A live quote for the ticket: Upstox first (read only), Yahoo (delayed) if it fails."""
+    sym = a.symbol.strip().upper()
+    broker = (a.broker or ("yahoo" if MARKET == "us" else "upstox")).lower()
+    now = parse_now(a.now)
+    q, via = None, ""
+    if broker == "upstox":
+        try:
+            q = upstox_quote(sym, a.key)
+            via = "Upstox (live)"
+        except TicketError as e:
+            if getattr(a, "no_fallback", False):
+                raise
+            print("Upstox quote failed (%s); using Yahoo (delayed) instead." % e, file=sys.stderr)
+    if q is None:
+        q = yahoo_quote(sym)
+        via = "Yahoo (delayed)"
+    if a.json:
+        print(json.dumps(dict(q, via=via, at=now.strftime("%Y-%m-%dT%H:%M:%SZ")), indent=2))
+    else:
+        chg = ""
+        if q.get("prev_close"):
+            chg = " (%+.2f%% vs prev close %s)" % (100.0 * (q["price"] / q["prev_close"] - 1),
+                                                   _money(q["prev_close"]))
+        print("%s %s%s  %s  [%s]" % (sym, _money(q["price"]), chg, q.get("time", ""), via))
+        print("For the ticket only: Upstox is live, Yahoo is delayed. The broker's price is the one that fills.")
     return 0
 
 
@@ -651,8 +944,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def clock(p):
-        p.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
-        p.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+        p.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+        p.add_argument("--today", help="YYYY-MM-DD (default: today in market time)")
+        p.add_argument("--market", choices=["nse", "us"], default=None,
+                       help="nse (default) or us; or set \"market\" in trader/config.json")
 
     def common(p):
         p.add_argument("--orders", default="trader/orders.json")
@@ -687,11 +982,23 @@ def main(argv=None):
     p.add_argument("--side", required=True, choices=["buy", "sell"])
     p.add_argument("--qty", required=True)
     p.add_argument("--price", required=True)
-    p.add_argument("--date", help="YYYY-MM-DD (default: today in New York)")
+    p.add_argument("--date", help="YYYY-MM-DD (default: today in market time)")
     p.add_argument("--now")
+    p.add_argument("--market", choices=["nse", "us"], default=None,
+                   help="nse (default) or us; or set \"market\" in trader/config.json")
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--state", default="trader/state/broker.json")
+    p = sub.add_parser("quote", help="a live quote for the ticket (Upstox, Yahoo fallback)")
+    p.add_argument("symbol")
+    p.add_argument("--key", help="Upstox instrument key NSE_EQ|<ISIN> (default: the known key for the symbol)")
+    p.add_argument("--broker", choices=["upstox", "yahoo"], default=None,
+                   help="upstox first with a Yahoo fallback (default on NSE), or yahoo only")
+    p.add_argument("--no-fallback", action="store_true", help="with --broker upstox, fail instead of falling back")
+    p.add_argument("--now")
+    p.add_argument("--market", choices=["nse", "us"], default=None,
+                   help="nse (default) or us")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("flatten", help="a sell ticket that closes a symbol's position by flat_by")
     p.add_argument("--symbol", required=True)
     p.add_argument("--qty", help="shares you hold, from get_open_position (default: trader/portfolio.json)")
@@ -709,8 +1016,13 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
-                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
+        prev = MARKET
+        set_market(getattr(a, "market", None) or "nse")
+        try:
+            return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
+                    "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log, "quote": cmd_quote}[a.cmd](a)
+        finally:
+            set_market(prev)
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1
