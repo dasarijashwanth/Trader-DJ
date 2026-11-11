@@ -8,6 +8,7 @@ earlier. It also finds the latest earnings press release (the EX-99 exhibit
 of the newest 8-K with item 2.02) and the latest 10-Q or 10-K.
 
     python3 facts.py AAPL
+    python3 facts.py RELIANCE --market nse    # NSE: screener.in + NSE announcements
     python3 facts.py AAPL KO --quarters 8
     python3 facts.py AAPL --json
     python3 facts.py AAPL AXP GOOGL KO BAC --metrics trader/metrics.json
@@ -47,8 +48,11 @@ import os
 import re
 import sys
 import time
+import http.cookiejar
 import urllib.error
+import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK%s.json"
@@ -75,6 +79,103 @@ FLOWS = ("revenue", "cost_of_revenue", "gross_profit", "operating_income", "net_
 class FactsError(Exception):
     pass
 
+# ---------------------------------------------------------------- market (NSE first at the CLI; --market us restores NYSE)
+# The module default is "us": the original NYSE behaviour, so direct callers
+# and the offline tests see exactly what they saw before. main() sets the
+# market from --market (default nse) or trader/config.json "market".
+MARKET = "us"
+
+NSE_HOLIDAYS = {  # NSE capital-market holidays 2026, from NSE holiday-master (CM segment).
+    "2026-01-15": "Municipal Corporation Election - Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-02-15": "Mahashivratri",
+    "2026-03-03": "Holi",
+    "2026-03-21": "Id-Ul-Fitr (Ramadan Eid)",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-08-15": "Independence Day",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-08": "Diwali Laxmi Pujan",
+    "2026-11-10": "Diwali-Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# NSE has no 1:00 p.m. early closes. Diwali's Muhurat session is a separate
+# evening session (about an hour, announced by circular); these tools treat
+# that day as closed for the day session. NSE's 2027 holidays are not
+# published yet (expected December 2026): years outside the list above are
+# treated as open on weekdays, so confirm them on nseindia.com.
+NSE_EARLY_CLOSE = {}
+NYSE_HOLIDAYS = {
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King, Jr. Day",
+    "2026-02-16": "Washington's Birthday",
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",
+    "2026-06-19": "Juneteenth National Independence Day",
+    "2026-07-03": "Independence Day (observed)",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving Day",
+    "2026-12-25": "Christmas Day",
+    "2027-01-01": "New Year's Day",
+    "2027-01-18": "Martin Luther King, Jr. Day",
+    "2027-02-15": "Washington's Birthday",
+    "2027-03-26": "Good Friday",
+    "2027-05-31": "Memorial Day",
+    "2027-06-18": "Juneteenth National Independence Day (observed)",
+    "2027-07-05": "Independence Day (observed)",
+    "2027-09-06": "Labor Day",
+    "2027-11-25": "Thanksgiving Day",
+    "2027-12-24": "Christmas Day (observed)",
+}
+NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
+    "2026-11-27": "day after Thanksgiving",
+    "2026-12-24": "Christmas Eve",
+    "2027-11-26": "day after Thanksgiving",
+}
+
+MARKETS = {
+    "nse": {"tz": "IST", "open": _dt.time(9, 15), "close": _dt.time(15, 30),
+            "early": None, "holidays": NSE_HOLIDAYS, "early_close": NSE_EARLY_CLOSE,
+            "currency": "\u20b9", "exchange": "NSE", "bars_per_day": 75},
+    "us": {"tz": "ET", "open": _dt.time(9, 30), "close": _dt.time(16, 0),
+           "early": _dt.time(13, 0), "holidays": NYSE_HOLIDAYS, "early_close": NYSE_EARLY_CLOSE,
+           "currency": "$", "exchange": "NYSE", "bars_per_day": 78},
+}
+
+
+def set_market(name):
+    """Switch the active market: 'nse' or 'us'. Raises FactsError otherwise."""
+    global MARKET
+    name = (name or "nse").lower()
+    if name not in MARKETS:
+        raise FactsError("--market wants nse or us, got %r" % name)
+    MARKET = name
+
+
+def mkt():
+    return MARKETS[MARKET]
+
+
+def tz_label():
+    return mkt()["tz"]
+
+
+def resolve_market(args, cfg=None):
+    """CLI/config market selection: --market wins, then trader/config.json
+    'market', then nse. Call before any market-aware work."""
+    name = getattr(args, "market", None)
+    if not name and cfg:
+        name = cfg.get("market")
+    set_market(name or "nse")
+
 
 def user_agent(cli=None, config="trader/config.json"):
     ua = (cli or os.environ.get("SEC_USER_AGENT") or "").strip()
@@ -92,6 +193,30 @@ def user_agent(cli=None, config="trader/config.json"):
 class Fetcher(object):
     def __init__(self, ua=None, offline=None, pause=0.15):
         self.ua, self.offline, self.pause, self._last = ua, offline, pause, 0.0
+
+    def text(self, url, name):
+        """A page (screener.in HTML) as text."""
+        if self.offline:
+            path = os.path.join(self.offline, name)
+            if not os.path.isfile(path):
+                raise FactsError("offline: no file %s" % path)
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        gap = time.time() - self._last
+        if gap < self.pause:
+            time.sleep(self.pause - gap)
+        self._last = time.time()
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
+        except urllib.error.HTTPError as exc:
+            raise FactsError("HTTP %s for %s" % (exc.code, url))
+        except urllib.error.URLError as exc:
+            raise FactsError("could not reach %s: %s" % (url, exc.reason))
+        return data.decode("utf-8", "replace")
 
     def json(self, url, name):
         if self.offline:
@@ -120,6 +245,271 @@ class Fetcher(object):
         except urllib.error.URLError as exc:
             raise FactsError("could not reach %s: %s" % (url, exc.reason))
         return json.loads(data.decode("utf-8"))
+
+
+# ---------------------------------------------------------------- NSE (nseindia.com + screener.in)
+# SEC EDGAR has no Indian companies, and Yahoo's quoteSummary is 401-blocked
+# from here, so for --market nse the numbers come from screener.in quarterly
+# results (consolidated page, #quarters table, Rs Crores) and the latest
+# results/board-meeting announcements from NSE (the Indian 8-K equivalent).
+# NSE's site 403s intermittently behind its bot check: the announcements call
+# retries once with a fresh session and says so plainly if it still fails.
+NSE_CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+NSE_BASE = "https://www.nseindia.com"
+NSE_ANNOUNCE_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=%s"
+NSE_ANNOUNCE_PAGE = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+SCREENER_URL = "https://www.screener.in/company/%s/consolidated/"
+SCREENER_STANDALONE_URL = "https://www.screener.in/company/%s/"
+SCREENER_PAGE = "https://www.screener.in/company/%s/"
+BROWSER_UA = ("Mozilla/5.0 (compatible; day-trader-skill/2.0; "
+              "+https://github.com/Jakeschincariol/day-trader-skill)")
+
+
+def nse_get_json(url, offline_path=None):
+    """GET an NSE JSON API. offline_path reads a saved file instead."""
+    if offline_path is not None:
+        if not os.path.isfile(offline_path):
+            raise FactsError("offline: no file %s" % offline_path)
+        with open(offline_path, encoding="utf-8") as fh:
+            return json.load(fh)
+    last = None
+    for _ in range(2):
+        cj = http.cookiejar.CookieJar()
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        try:
+            try:
+                req = urllib.request.Request(NSE_BASE + "/", headers={"User-Agent": NSE_CHROME_UA})
+                op.open(req, timeout=30).read()
+            except Exception:
+                pass  # the home page itself 403s from here; the API often still answers
+            req = urllib.request.Request(url, headers={
+                "User-Agent": NSE_CHROME_UA, "Referer": NSE_BASE + "/",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9"})
+            with op.open(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last = FactsError("NSE answered HTTP %d for %s" % (e.code, url.split("?")[0]))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            last = FactsError("could not read NSE %s: %s" % (url.split("?")[0], e))
+    raise last
+
+
+def nse_announcements(symbol, offline=None):
+    """Corporate announcements for one NSE symbol."""
+    path = os.path.join(offline, "nse-ann-%s.json" % symbol) if offline else None
+    return nse_get_json(NSE_ANNOUNCE_URL % urllib.parse.quote(symbol), offline_path=path)
+
+
+def _nse_ann_date(value):
+    """'06-Nov-2026 19:10:58' -> datetime, for newest-first ordering."""
+    try:
+        return _dt.datetime.strptime((value or "").strip(), "%d-%b-%Y %H:%M:%S")
+    except ValueError:
+        return _dt.datetime.min
+
+
+def latest_nse_filings(data):
+    """Newest Financial Result Updates and Outcome of Board Meeting items.
+    The API list is not in date order, so the newest is picked by an_dt."""
+    out = {"results": None, "board": None}
+    for a in data if isinstance(data, list) else []:
+        desc = (a.get("desc") or "").strip()
+        rec = {"category": desc, "filed": (a.get("an_dt") or "")[:11],
+               "url": a.get("attchmntFile") or NSE_ANNOUNCE_PAGE,
+               "text": " ".join((a.get("attchmntText") or "").split()),
+               "_when": _nse_ann_date(a.get("an_dt"))}
+        key = "results" if desc == "Financial Result Updates" else \
+            "board" if desc == "Outcome of Board Meeting" else None
+        if key and (out[key] is None or rec["_when"] > out[key]["_when"]):
+            out[key] = rec
+    for rec in out.values():
+        if rec:
+            rec.pop("_when", None)
+    return out
+
+
+def _norm_label(text):
+    return " ".join(text.replace("\xa0", " ").split()).rstrip("+").strip().lower()
+
+
+class _QuartersParser(HTMLParser):
+    """The #quarters table of a screener.in company page.
+
+    -> headers (['', 'Sep 2023', ...]) and rows {'sales': ['231,886', ...]}.
+    Row labels carry a trailing '+' on screener ('Sales +'); it is stripped."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_quarters = self.in_table = self.in_row = self.in_cell = False
+        self.cell, self.row, self.headers, self.rows = [], [], None, {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "section" and dict(attrs).get("id") == "quarters":
+            self.in_quarters = True
+        if not self.in_quarters:
+            return
+        if tag == "table" and not self.in_table:
+            self.in_table = True
+        elif tag == "tr" and self.in_table:
+            self.in_row, self.row = True, []
+        elif tag in ("td", "th") and self.in_row:
+            self.in_cell, self.cell = True, []
+
+    def handle_endtag(self, tag):
+        if tag == "section" and self.in_quarters:
+            self.in_quarters = False
+            return
+        if not self.in_quarters:
+            return
+        if tag == "table" and self.in_table:
+            self.in_table = False
+        elif tag in ("td", "th") and self.in_cell:
+            self.in_cell = False
+            self.row.append(" ".join("".join(self.cell).split()))
+        elif tag == "tr" and self.in_row:
+            self.in_row = False
+            if self.row:
+                if self.headers is None:
+                    self.headers = self.row
+                else:
+                    self.rows[_norm_label(self.row[0])] = self.row[1:]
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.cell.append(data)
+
+
+def _screener_num(text):
+    """'2,36,217' -> 236217.0; '18%' -> 18.0; '-' / '' -> None."""
+    if text is None:
+        return None
+    t = text.strip().replace(",", "").rstrip("%").strip()
+    if t in ("", "-", "--"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def parse_screener_quarters(html):
+    """Screener.in company page HTML -> {'quarters': [...], 'rows': {...}}."""
+    p = _QuartersParser()
+    p.feed(html)
+    if not p.headers or "sales" not in p.rows:
+        raise FactsError("no quarterly results table on the screener.in page")
+    return {"quarters": [h for h in p.headers[1:] if h], "rows": p.rows}
+
+
+_Q_END = {"Mar": (3, 31), "Jun": (6, 30), "Sep": (9, 30), "Dec": (12, 31)}
+_Q_START = {"Mar": (1, 1), "Jun": (4, 1), "Sep": (7, 1), "Dec": (10, 1)}
+
+
+def _quarter_end(label):
+    m = re.match(r"^(Mar|Jun|Sep|Dec)\s+(\d{4})$", (label or "").strip())
+    if not m:
+        return None
+    mon, day = _Q_END[m.group(1)]
+    return "%s-%02d-%02d" % (m.group(2), mon, day)
+
+
+def _quarter_start(label):
+    m = re.match(r"^(Mar|Jun|Sep|Dec)\s+(\d{4})$", (label or "").strip())
+    if not m:
+        return None
+    mon, day = _Q_START[m.group(1)]
+    return "%s-%02d-%02d" % (m.group(2), mon, day)
+
+
+def _prior_year(end):
+    """The same quarter-end a year earlier ('2026-09-30' -> '2025-09-30')."""
+    d = _dt.date.fromisoformat(end)
+    try:
+        return d.replace(year=d.year - 1).isoformat()
+    except ValueError:
+        return None
+
+
+def _in_fiscal(end):
+    """Quarter end -> Indian fiscal label: Sep 2026 is Q2 FY27 (FY ends Mar 31)."""
+    d = _dt.date.fromisoformat(end)
+    q = (d.month - 1) // 3 + 1
+    fq = {1: 4, 2: 1, 3: 2, 4: 3}[q]
+    fy = d.year + 1 if d.month >= 4 else d.year
+    return "Q%d FY%d" % (fq, fy % 100)
+
+
+def analyse_screener(parsed, quarters=6, name=None):
+    """Screener.in quarterly rows -> the analyse() result shape, in Rs Crores
+    (EPS in Rs). No derived Q4: screener lists every quarter as reported."""
+    labels = parsed["quarters"]
+    rows = parsed["rows"]
+
+    def series_for(key):
+        out = {}
+        for lab, v in zip(labels, rows.get(key, [])):
+            end = _quarter_end(lab)
+            num = _screener_num(v)
+            if end and num is not None:
+                out[end] = num
+        return out
+
+    rev = series_for("sales")
+    oi = series_for("operating profit")
+    opm = series_for("opm %")
+    ni = series_for("net profit")
+    eps = series_for("eps in rs")
+    if not rev and not ni:
+        raise FactsError("no quarterly sales or net profit on the screener.in page")
+    end_to_label = {_quarter_end(x): x for x in labels if _quarter_end(x)}
+    ends = sorted(set(rev) | set(ni), reverse=True)[:quarters]
+    out_rows = []
+    for end in ends:
+        r, o, n, e = rev.get(end), oi.get(end), ni.get(end), eps.get(end)
+        prior = _prior_year(end)
+        out_rows.append({
+            "end": end, "start": _quarter_start(end_to_label.get(end, "")),
+            "fiscal": _in_fiscal(end),
+            "derived": False, "revenue": r, "gross_profit": None,
+            "operating_income": o, "net_income": n,
+            "eps_diluted": round(e, 2) if e is not None else None,
+            "gross_margin": None, "operating_margin": opm.get(end),
+            "net_margin": margin(n, r),
+            "revenue_yoy": pct(r, rev.get(prior)) if r is not None else None,
+            "net_income_yoy": pct(n, ni.get(prior)) if n is not None else None,
+            "eps_yoy": pct(e, eps.get(prior)) if e is not None else None,
+            "filed": None, "form": "screener.in",
+        })
+    ttm = {}
+    for key, s in (("revenue", rev), ("net_income", ni), ("eps_diluted", eps)):
+        last4 = sorted(s)[-4:]
+        if len(last4) == 4 and (_date(last4[-1]) - _date(last4[0])).days < 300:
+            ttm[key] = sum(s[e] for e in last4)
+    if "eps_diluted" in ttm:
+        ttm["eps_diluted"] = round(ttm["eps_diluted"], 2)
+    return {"entity": name, "cik": None, "rows": out_rows, "ttm": ttm,
+            "concepts": {"revenue": ["screener.in Sales"], "net_income": ["screener.in Net Profit"],
+                         "eps_diluted": ["screener.in EPS in Rs"]},
+            "unit": "INR", "source": "screener.in quarterly results (consolidated)"}
+
+
+def fetch_screener(fetcher, symbol):
+    """Consolidated quarterly results page; falls back to the standalone page
+    when the consolidated one has no quarters table."""
+    for url, name in ((SCREENER_URL % symbol, "screener-%s.html" % symbol),
+                      (SCREENER_STANDALONE_URL % symbol, "screener-%s-standalone.html" % symbol)):
+        try:
+            html = fetcher.text(url, name)
+        except FactsError:
+            continue
+        try:
+            return parse_screener_quarters(html), url
+        except FactsError:
+            continue
+    raise FactsError("no quarterly results table on screener.in for %s (see %s)"
+                     % (symbol, SCREENER_PAGE % symbol))
 
 
 # ---------------------------------------------------------------- facts
@@ -300,8 +690,14 @@ def changes(result):
     prev = rows[1] if len(rows) > 1 else None
     out = []
 
+    inr = result.get("unit") == "INR"
+
     def money(v):
-        return "n/a" if v is None else "$%.2fB" % (v / 1e9) if abs(v) >= 1e9 else "$%.1fM" % (v / 1e6)
+        if v is None:
+            return "n/a"
+        if inr:
+            return "\u20b9{:,.0f} Cr".format(v)
+        return "$%.2fB" % (v / 1e9) if abs(v) >= 1e9 else "$%.1fM" % (v / 1e6)
 
     label = "Quarter ending %s%s" % (cur["end"], " (derived from the 10-K)" if cur["derived"] else "")
     line = "%s: revenue %s" % (label, money(cur["revenue"]))
@@ -311,7 +707,7 @@ def changes(result):
     if cur["net_income_yoy"] is not None:
         line += " (%+.1f%%)" % cur["net_income_yoy"]
     if cur["eps_diluted"] is not None:
-        line += ", diluted EPS $%.2f" % cur["eps_diluted"]
+        line += ", diluted EPS %s%.2f" % ("\u20b9" if inr else "$", cur["eps_diluted"])
         if cur["eps_yoy"] is not None:
             line += " (%+.1f%%)" % cur["eps_yoy"]
     out.append(line + ".")
@@ -397,7 +793,54 @@ def _pm(v):
     return "-" if v is None else "%.1f%%" % v
 
 
+def render_inr(ticker, result, filings):
+    """Screener.in quarterly table (Rs Crores, EPS in Rs) + NSE announcements."""
+    out = ["%s (%s). Rs Crores except EPS (Rs). Source: %s." % (
+        result["entity"], ticker, result.get("source") or "screener.in"), ""]
+    out.append("%-11s %-9s %10s %8s %7s %7s %10s %8s %7s" % (
+        "quarter end", "fiscal", "sales", "sales yoy", "opm", "net mgn",
+        "net profit", "EPS", "EPS yoy"))
+    for r in result["rows"]:
+        out.append("%-11s %-9s %10s %8s %7s %7s %10s %8s %7s" % (
+            r["end"], r["fiscal"].strip()[:9], _m_inr(r["revenue"]), _p(r["revenue_yoy"]),
+            _pm(r["operating_margin"]), _pm(r["net_margin"]),
+            _m_inr(r["net_income"]), "-" if r["eps_diluted"] is None else "%.2f" % r["eps_diluted"],
+            _p(r["eps_yoy"])))
+    t = result["ttm"]
+    if t:
+        out.append("")
+        out.append("Last 4 quarters: sales %s, net profit %s, EPS %s." % (
+            "\u20b9" + _m_inr(t.get("revenue")) + " Cr" if t.get("revenue") is not None else "-",
+            "\u20b9" + _m_inr(t.get("net_income")) + " Cr" if t.get("net_income") is not None else "-",
+            "\u20b9%.2f" % t["eps_diluted"] if t.get("eps_diluted") is not None else "-"))
+    out.append("")
+    out.append("What changed:")
+    for line in changes(result):
+        out.append("  - " + line)
+    if filings:
+        out.append("")
+        res, brd = filings.get("results"), filings.get("board")
+        if res:
+            out.append("Latest results announcement (%s): %s  %s" % (res["filed"], res["text"][:160], res["url"]))
+        if brd:
+            out.append("Latest board-meeting outcome (%s): %s  %s" % (brd["filed"], brd["text"][:160], brd["url"]))
+        if filings.get("error"):
+            out.append("NOTE: NSE announcements could not be read: %s. See %s"
+                       % (filings["error"], NSE_ANNOUNCE_PAGE))
+    out.append("")
+    out.append("Screener.in lists every quarter as reported; there is no derived Q4 here.")
+    return "\n".join(out) + "\n"
+
+
+def _m_inr(v):
+    if v is None:
+        return "-"
+    return "{:,.0f}".format(v)
+
+
 def render(ticker, result, filings):
+    if result.get("unit") == "INR":
+        return render_inr(ticker, result, filings)
     out = ["%s (%s), CIK %s. US$ millions except EPS. Source: SEC XBRL company facts." % (
         result["entity"], ticker, result["cik"]), ""]
     out.append("%-11s %-9s %10s %8s %7s %7s %7s %10s %8s %7s" % (
@@ -450,7 +893,8 @@ def metrics_row(ticker, result):
             "revenue_growth_yoy": cur.get("revenue_yoy"), "eps_growth_yoy": cur.get("eps_yoy"),
             "net_income_growth_yoy": cur.get("net_income_yoy"),
             "gross_margin": cur.get("gross_margin"), "operating_margin": cur.get("operating_margin"),
-            "net_margin": cur.get("net_margin"), "source": "SEC XBRL company facts"}
+            "net_margin": cur.get("net_margin"), "unit": result.get("unit", "USD"),
+            "source": result.get("source") or "SEC XBRL company facts"}
 
 
 def clean_title(title):
@@ -467,6 +911,17 @@ def ticker_ciks(fetcher):
     return out
 
 
+def read_config(path):
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except ValueError:
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("tickers", nargs="*", help="tickers, e.g. AAPL KO")
@@ -477,25 +932,61 @@ def main(argv=None):
     ap.add_argument("--user-agent")
     ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--offline", metavar="DIR")
+    ap.add_argument("--market", choices=["nse", "us"], default=None,
+                    help="nse (default) or us; or set \"market\" in trader/config.json")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+    prev_market = MARKET
+    resolve_market(args, read_config(args.config))
+    try:
+        return _run_main(args, ap)
+    finally:
+        set_market(prev_market)
+
+
+def _run_main(args, ap=None):
     if not args.tickers and not args.cik:
-        ap.print_help()
+        if ap is not None:
+            ap.print_help()
         return 2
     ua = user_agent(args.user_agent, args.config)
-    if not ua and not args.offline:
+    if not ua and not args.offline and MARKET == "us":
         print("facts: " + UA_HELP, file=sys.stderr)
         return 2
     fetcher = Fetcher(ua, offline=args.offline)
     results, rows, failed = [], [], 0
     try:
-        ciks = {} if args.cik else ticker_ciks(fetcher)
+        # NSE never touches SEC: skip the ticker->CIK lookup (it needs a UA).
+        ciks = {} if args.cik or MARKET == "nse" else ticker_ciks(fetcher)
     except FactsError as exc:
         print("facts: %s" % exc, file=sys.stderr)
         return 2
     wanted = args.tickers or [args.cik]
     for t in wanted:
         tick = t.upper()
+        if MARKET == "nse":
+            # SEC EDGAR has no Indian companies and Yahoo quoteSummary is
+            # 401-blocked: screener.in quarterly results + NSE announcements.
+            try:
+                parsed, _url = fetch_screener(fetcher, tick)
+                result = analyse_screener(parsed, quarters=args.quarters, name=tick)
+                filings = None
+                if not args.no_filings:
+                    try:
+                        filings = latest_nse_filings(nse_announcements(tick, fetcher.offline))
+                    except FactsError as exc:
+                        filings = {"error": str(exc)}
+            except FactsError as exc:
+                print("facts: %s: %s" % (tick, exc), file=sys.stderr)
+                failed += 1
+                continue
+            results.append({"ticker": tick, "result": result, "filings": filings,
+                            "changes": changes(result), "note": None})
+            rows.append(metrics_row(tick, result))
+            if not args.json:
+                sys.stdout.write(render(tick, result, filings))
+                sys.stdout.write("\n")
+            continue
         if args.cik:
             cik, name = str(args.cik).zfill(10), None
         else:

@@ -1,16 +1,18 @@
 ---
 name: trader-analyst
 description: >-
-  The Earnings Analyst. Reads a company's reported numbers straight from SEC
-  EDGAR (XBRL company facts from its 10-Qs and 10-Ks, plus the latest earnings
-  8-K and its press release) and sums up what changed: revenue, gross,
-  operating and net margins, net income and diluted EPS, quarter by quarter,
-  each against the same quarter a year earlier, with the trailing twelve
-  months. Reads an earnings call transcript when you paste one. Use when the
-  user says "how did Tesla's earnings look", "analyze the earnings", "what
-  changed this quarter", "is revenue growing", "check the 10-Q", "compare
-  margins", "sum up the call", "does it report this week", or before trading
-  a stock around its earnings.
+  The Earnings Analyst. Reads a company's reported numbers straight from its
+  filings and sums up what changed: revenue, gross, operating and net
+  margins, net income and diluted EPS, quarter by quarter, each against the
+  same quarter a year earlier, with the trailing twelve months. US stocks:
+  SEC EDGAR XBRL company facts from 10-Qs and 10-Ks, plus the latest
+  earnings 8-K and its press release. NSE stocks (the default market):
+  screener.in quarterly results (consolidated, Rs Crores) plus the latest
+  results and board-meeting announcements from NSE. Reads an earnings call
+  transcript when you paste one. Use when the user says "how did Reliance's
+  earnings look", "analyze the earnings", "what changed this quarter", "is
+  revenue growing", "check the 10-Q", "compare margins", "sum up the call",
+  "does it report this week", or before trading a stock around its earnings.
 argument-hint: "[tickers]"
 ---
 
@@ -28,17 +30,32 @@ Tool in this folder (standard library Python, no keys):
 python3 "${CLAUDE_SKILL_DIR}/facts.py" --help
 ```
 
-It needs the SEC User-Agent (`sec_user_agent` in `trader/config.json`, or
-`SEC_USER_AGENT`): "Your Name you@example.com" with the user's real name and
-email. It refuses to call SEC without one.
+For `--market us` it needs the SEC User-Agent (`sec_user_agent` in
+`trader/config.json`, or `SEC_USER_AGENT`): "Your Name you@example.com" with
+the user's real name and email. It refuses to call SEC without one. The NSE
+path needs no key: screener.in works without a login, and NSE announcements
+are read with a cookied session (retried once on 403; an honest failure
+message if it still fails).
 
 ## What it reads and writes
 
-- Reads `https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json` (every
-  number the company has tagged in its filings), the company's submissions
-  list (for the newest 10-Q or 10-K and the newest 8-K with item 2.02,
-  "Results of Operations") and that 8-K's folder to find the press release
-  (the EX-99.1 exhibit).
+- US: reads `https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json`
+  (every number the company has tagged in its filings), the company's
+  submissions list (for the newest 10-Q or 10-K and the newest 8-K with item
+  2.02, "Results of Operations") and that 8-K's folder to find the press
+  release (the EX-99.1 exhibit).
+- NSE (default): reads the quarterly results table (`#quarters`) from
+  `https://www.screener.in/company/RELIANCE/consolidated/` (standalone page
+  as fallback) and the latest Financial Result Updates and Outcome of Board
+  Meeting items from NSE corporate announcements. Figures are Rs Crores,
+  EPS in Rs, quarters labelled by Indian fiscal year (Sep 2026 is Q2 FY27).
+  There is no derived Q4: screener lists every quarter as reported. Yahoo's
+  quoteSummary is 401-blocked from here and SEC EDGAR has no Indian
+  companies, so neither is used for NSE. One quirk: the NSE announcements
+  API slice can lag on the results category (for RELIANCE its newest
+  Financial Result Updates item was Jan 2025 while the Oct 30, 2026 board
+  outcome already carries the Sep 2026 results), so the tool prints both
+  and the board outcome is the fresher pointer.
 - Writes `trader/metrics.json` with `--metrics`: one row per company (TTM
   revenue, net income and diluted EPS, the latest margins and growth), for
   your notes or a spreadsheet. `metrics.example.json` in this folder is a
@@ -74,8 +91,10 @@ email. It refuses to call SEC without one.
    `trader/watchlist.json`):
 
    ```bash
-   python3 "${CLAUDE_SKILL_DIR}/facts.py" TSLA
-   python3 "${CLAUDE_SKILL_DIR}/facts.py" TSLA NVDA AMD --metrics trader/metrics.json
+   python3 "${CLAUDE_SKILL_DIR}/facts.py" RELIANCE --market nse
+   python3 "${CLAUDE_SKILL_DIR}/facts.py" RELIANCE TCS --market nse --quarters 8
+   python3 "${CLAUDE_SKILL_DIR}/facts.py" TSLA --market us
+   python3 "${CLAUDE_SKILL_DIR}/facts.py" TSLA NVDA AMD --market us --metrics trader/metrics.json
    ```
 
    `--quarters 8` shows two years, `--json` everything machine-readable,
@@ -89,6 +108,16 @@ email. It refuses to call SEC without one.
 4. If the next report falls inside the planned trade (an overnight hold, or a
    report before the open), say it before `/trader-exit` sets the stop: a stop
    does not protect against a gap, the stock can open past it.
+
+## Example: NSE
+
+`facts.py RELIANCE --market nse` (run 2026-11-11): quarter ending 2026-09-30
+(Q2 FY27), sales ₹330,601 Cr, +29.8% against a year earlier, net profit
+₹29,550 Cr, diluted EPS ₹18.88 (+40.7%); operating margin 17.0% (+2.0
+points on the quarter before). Last four quarters: sales ₹1,199,033 Cr,
+net profit ₹95,625 Cr, EPS ₹60.68. TCS the same day: quarter ending
+2026-09-30, sales ₹73,188 Cr (+11.2%), net profit ₹13,934 Cr, EPS ₹38.37,
+operating margin 26.0%.
 
 ## Example: the reel's stock
 
