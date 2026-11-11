@@ -8,7 +8,9 @@ description: >-
   writes ONE bracket order (entry, stop-loss, take-profit) to
   trader/orders.json in the exact shape of Alpaca's place_stock_order. A stop
   too far away for your max loss is a plain refusal, not a smaller order.
-  Nothing is placed. Use when the user says "how many shares", "size this
+  Nothing is placed. NSE by default (amounts in rupees, 9:15 a.m. to 3:30 p.m.
+  IST, Upstox paper tickets, no pattern-day-trader rule); --market us restores
+  the NYSE version. Use when the user says "how many shares", "size this
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
   a plan.
@@ -26,6 +28,27 @@ loss small; it does not make a trade win.
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+## NSE by default
+
+This skill trades NSE first. `--market us` (or `"market": "us"` in
+`trader/config.json`) restores the NYSE version. On NSE:
+
+- Amounts are rupees everywhere: budget, risk, position sizes, all printed
+  with ₹. Start from `config-nse.example.json` in this folder (₹500,000
+  budget, 10% cash buffer, ₹5,000 max loss per trade, ₹15,000 daily loss,
+  entry window 09:30 to 15:00 IST, flat by 15:15 IST, broker upstox, paper
+  true). The config keys keep their US names (`max_loss_per_trade_usd` and
+  friends hold rupee amounts on NSE).
+- The session is 9:15 a.m. to 3:30 p.m. IST, 75 five-minute bars a day.
+  `--now "2026-11-11 10:00"` pins the clock in IST on NSE, New York time
+  with `--market us`.
+- There is no pattern-day-trader rule in India, so there is no PDT check.
+- Whole shares only: NSE trades whole shares, and neither Alpaca nor Upstox
+  takes fractions in a bracket order.
+- The bracket order it writes is a paper ticket for Upstox, never a placed
+  order. trader-risk checks it, trader-broker shows it and asks the user yes
+  or no.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/size.py"                        # trader/plan.json + trader/config.json
 python3 "${CLAUDE_SKILL_DIR}/size.py" --write                # write trader/orders.json
@@ -34,7 +57,8 @@ python3 "${CLAUDE_SKILL_DIR}/size.py" --limit 364.00 --json  # a limit order at 
 python3 "${CLAUDE_SKILL_DIR}/size.py" --weights AAPL=40,KO=60 --config split.json   # weights mode, below
 ```
 
-`--now "2026-10-19 10:15"` pins the clock (New York time). A plan for
+`--now "2026-10-19 10:15"` pins the clock (market time: IST on NSE, New York
+time with `--market us`). A plan for
 another day is refused: make a new one with trader-exit.
 
 ## What it reads and writes
@@ -49,7 +73,8 @@ another day is refused: make a new one with trader-exit.
 
 ## Step 1: set the rules once
 
-If `trader/config.json` does not exist, copy `config.example.json` into
+If `trader/config.json` does not exist, copy `config.example.json` (NYSE) or
+`config-nse.example.json` (NSE, rupees) into
 `trader/config.json` and ask the user for each value in plain words:
 
 - **budget**: how much money this is for. Only money they can afford to lose.
@@ -69,7 +94,8 @@ If `trader/config.json` does not exist, copy `config.example.json` into
 python3 "${CLAUDE_SKILL_DIR}/size.py" --write
 ```
 
-Whole shares only: Alpaca takes no fractions in a bracket order. The size is
+Whole shares only: Alpaca takes no fractions in a bracket order, and NSE
+trades whole shares only, so Upstox takes none either. The size is
 the smallest of four limits:
 
 | limit | shares |
@@ -125,6 +151,22 @@ sent to Alpaca. With the stop at 300.00 instead, one share would risk 64.18,
 more than the $50 max loss: no order. At 10:52 the real quote was 366.48, so
 the same plan sizes to 6 shares at 8.16 a share, and reward:risk falls to
 0.44: refused, because the move it was waiting for has mostly happened.
+
+## Example: RELIANCE on NSE (verified live 2026-11-11)
+
+RELIANCE on Wednesday 2026-11-11. Opening-range breakout: entry 1335.40 at
+10:00 AM IST, stop 1320.00, target 1350.80 (1R). Risk 15.40 a share. The NSE
+example config: ₹500,000 budget, 10% cash buffer, ₹5,000 max loss.
+
+| limit | the math | shares |
+| --- | --- | --- |
+| max loss | ₹5,000 / 15.40 | 324 |
+| position cap | 75% of ₹500,000 = ₹375,000 / 1335.40 | **280 (decides it)** |
+| max order | ₹400,000 / 1335.40 | 299 |
+| cash | ₹500,000 minus ₹50,000 = ₹450,000 / 1335.40 | 336 |
+
+280 shares = ₹373,912. Max loss at the stop: 280 x 15.40 = ₹4,312. The live
+Yahoo quote that day was ₹1335.40, the same as the plan's entry.
 
 ## Weights mode (kept from v1)
 

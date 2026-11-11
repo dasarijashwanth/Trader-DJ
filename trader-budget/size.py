@@ -11,9 +11,13 @@ checks the order and trader-broker asks you yes or no.
     python3 size.py --write                          # write trader/orders.json
     python3 size.py --limit                          # a limit order at the plan's entry
     python3 size.py --limit 364.00 --write           # a limit order at 364.00
-    python3 size.py --now "2026-10-19 10:15" --json  # pin the clock (New York time)
+    python3 size.py --now "2026-10-19 10:15" --json  # pin the clock (market time: IST for NSE, New York for US)
 
-How many shares. Whole shares only: Alpaca takes no fractions in a bracket.
+NSE by default (--market us for NYSE): amounts in \u20b9, the session is 9:15 a.m. to 3:30 p.m. IST,
+there is no pattern-day-trader rule, and the bracket order is a paper ticket for Upstox, never a
+placed order. Start from config-nse.example.json in this folder for an INR setup.
+
+How many shares. Whole shares only: neither Alpaca nor Upstox takes fractions in a bracket (NSE trades whole shares only).
 
     shares = floor of the smallest of
       max loss       max_loss_per_trade_usd / risk per share (entry minus stop)
@@ -92,7 +96,110 @@ class SizeError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time (New York, no tz files)
+# ---------------------------------------------------------------- market (NSE first at the CLI; --market us restores NYSE)
+# The module default is "us": the original NYSE behaviour, so direct callers
+# and the offline tests see exactly what they saw before. main() sets the
+# market from --market (default nse) or trader/config.json "market".
+MARKET = "us"
+
+NYSE_HOLIDAYS = {
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King, Jr. Day",
+    "2026-02-16": "Washington's Birthday",
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",
+    "2026-06-19": "Juneteenth National Independence Day",
+    "2026-07-03": "Independence Day (observed)",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving Day",
+    "2026-12-25": "Christmas Day",
+    "2027-01-01": "New Year's Day",
+    "2027-01-18": "Martin Luther King, Jr. Day",
+    "2027-02-15": "Washington's Birthday",
+    "2027-03-26": "Good Friday",
+    "2027-05-31": "Memorial Day",
+    "2027-06-18": "Juneteenth National Independence Day (observed)",
+    "2027-07-05": "Independence Day (observed)",
+    "2027-09-06": "Labor Day",
+    "2027-11-25": "Thanksgiving Day",
+    "2027-12-24": "Christmas Day (observed)",
+}
+NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
+    "2026-11-27": "day after Thanksgiving",
+    "2026-12-24": "Christmas Eve",
+    "2027-11-26": "day after Thanksgiving",
+}
+
+NSE_HOLIDAYS = {  # NSE capital-market holidays 2026, from NSE holiday-master (CM segment).
+    "2026-01-15": "Municipal Corporation Election - Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-02-15": "Mahashivratri",
+    "2026-03-03": "Holi",
+    "2026-03-21": "Id-Ul-Fitr (Ramadan Eid)",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-08-15": "Independence Day",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-08": "Diwali Laxmi Pujan",
+    "2026-11-10": "Diwali-Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# NSE has no 1:00 p.m. early closes. Diwali's Muhurat session is a separate
+# evening session (about an hour, announced by circular); these tools treat
+# that day as closed for the day session. NSE's 2027 holidays are not
+# published yet (expected December 2026): years outside the list above are
+# treated as open on weekdays, so confirm them on nseindia.com.
+NSE_EARLY_CLOSE = {}
+
+MARKETS = {
+    "nse": {"tz": "IST", "open": datetime.time(9, 15), "close": datetime.time(15, 30),
+            "early": None, "holidays": NSE_HOLIDAYS, "early_close": NSE_EARLY_CLOSE,
+            "currency": "\u20b9", "exchange": "NSE", "bars_per_day": 75},
+    "us": {"tz": "ET", "open": datetime.time(9, 30), "close": datetime.time(16, 0),
+           "early": datetime.time(13, 0), "holidays": NYSE_HOLIDAYS, "early_close": NYSE_EARLY_CLOSE,
+           "currency": "$", "exchange": "NYSE", "bars_per_day": 78},
+}
+
+
+def set_market(name):
+    """Switch the active market: 'nse' or 'us'. Raises SizeError otherwise."""
+    global MARKET
+    name = (name or "nse").lower()
+    if name not in MARKETS:
+        raise SizeError("--market wants nse or us, got %r" % name)
+    MARKET = name
+
+
+def mkt():
+    return MARKETS[MARKET]
+
+
+def tz_label():
+    return mkt()["tz"]
+
+
+def tz_name():
+    """The prose name of the market's time zone: 'New York' for NYSE, 'IST' for NSE."""
+    return "New York" if MARKET == "us" else "IST"
+
+
+def resolve_market(args, cfg=None):
+    """CLI/config market selection: --market wins, then trader/config.json
+    'market', then nse. Call before any market-aware work."""
+    name = getattr(args, "market", None)
+    if not name and cfg:
+        name = cfg.get("market")
+    set_market(name or "nse")
+
+# ---------------------------------------------------------------- time (market time, no tz files)
 
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
@@ -111,11 +218,28 @@ def eastern_offset(utc):
     return -4 if start <= naive < end else -5
 
 
+def market_offset(utc):
+    """Hours from UTC for the active market. IST is +5:30 all year (no DST);
+    New York is -4 in daylight time, -5 otherwise."""
+    if MARKET == "nse":
+        return 5.5
+    return eastern_offset(utc)
+
+
 def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+    """Naive UTC -> naive market wall-clock time. Kept the old name for the
+    offline tests; it follows the active market (IST for NSE, ET for NYSE)."""
+    return utc.replace(tzinfo=None) + datetime.timedelta(hours=market_offset(utc))
+
+
+def to_local(utc):
+    return to_eastern(utc)
 
 
 def eastern_to_utc(local):
+    """Naive market wall-clock time -> naive UTC."""
+    if MARKET == "nse":
+        return local - datetime.timedelta(hours=5, minutes=30)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -123,15 +247,19 @@ def eastern_to_utc(local):
     return local + datetime.timedelta(hours=5)
 
 
+def local_to_utc(local):
+    return eastern_to_utc(local)
+
+
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as market time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise SizeError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise SizeError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % tz_label())
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -294,10 +422,12 @@ def _num(x):
 
 
 def money(x):
+    """Whole rupees/dollars with no decimals, else two: \u20b91,335.40, $2,913.44."""
+    cur = mkt()["currency"]
     x = float(x)
     if abs(x - round(x)) < 0.005:
-        return "$" + "{:,.0f}".format(round(x))
-    return "$" + "{:,.2f}".format(x)
+        return cur + "{:,.0f}".format(round(x))
+    return cur + "{:,.2f}".format(x)
 
 
 # ---------------------------------------------------------------- plan mode (the default)
@@ -320,8 +450,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if side != "buy":
         raise SizeError("this pack sizes long (buy) day trades only; the plan says %r" % side)
     if today and plan.get("date") and str(plan["date"]) != today:
-        raise SizeError("the plan is for %s and today is %s in New York: make a new plan with trader-exit"
-                        % (plan["date"], today))
+        raise SizeError("the plan is for %s and today is %s in %s: make a new plan with trader-exit"
+                        % (plan["date"], today, tz_name()))
     entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
     for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
         if v is None or v <= 0:
@@ -477,8 +607,8 @@ def plan_report(s, order, notes=()):
                  % (order["qty"], order["symbol"], how, order["take_profit_limit_price"],
                     order["stop_loss_stop_price"]))
     if s["flat_by"]:
-        lines.append("Flat by %s New York: anything still open then gets closed (trader-alerts rings, "
-                     "trader-broker flatten)." % s["flat_by"])
+        lines.append("Flat by %s %s: anything still open then gets closed (trader-alerts rings, "
+                     "trader-broker flatten)." % (s["flat_by"], tz_name()))
     lines.append("")
     lines.append("Next: trader-risk checks it, then trader-broker asks you yes or no.")
     lines.append("Education and tooling, not financial advice.")
@@ -651,11 +781,11 @@ def size(rows, cfg, budget=None, prices=None, whole=None, cents=False, top=None)
             break
         worst = min(small, key=lambda r: (r["source_weight"], r["ticker"]))
         if whole and shares is not None and shares[worst["ticker"]] == 0 and prices.get(worst["ticker"], 0) > 0:
-            reason = ("one share costs $%s, more than its slice; it cannot be bought in whole shares"
-                      % _num(prices[worst["ticker"]]))
+            reason = ("one share costs %s, more than its slice; it cannot be bought in whole shares"
+                      % money(prices[worst["ticker"]]))
         else:
-            reason = "its slice ($%s) is under your $%s minimum order" % (
-                _num(dollars[worst["ticker"]]), _num(min_order))
+            reason = "its slice (%s) is under your %s minimum order" % (
+                money(dollars[worst["ticker"]]), money(min_order))
         dropped.append({"ticker": worst["ticker"], "reason": reason})
         keep = [r for r in keep if r["ticker"] != worst["ticker"]]
         if not keep:
@@ -793,12 +923,12 @@ def run_plan(a, cfg):
         if p is not None and fresh:
             price = p
             if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
-                notes.append("%s last %s (as of %s New York) is above the plan's entry %s, so the risk "
+                notes.append("%s last %s (as of %s %s) is above the plan's entry %s, so the risk "
                              "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"),
-                                                          _price(plan.get("entry")), _price(p)))
+                                                          tz_name(), _price(plan.get("entry")), _price(p)))
         elif p is not None:
             notes.append("%s in %s is %s: not used (older than %d minutes). Sized at the plan's entry."
-                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " New York")
+                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " " + tz_name())
                             if t else "undated", FRESH_MINUTES))
     cash = None
     if a.portfolio and os.path.exists(a.portfolio):
@@ -854,7 +984,9 @@ def main(argv=None):
     ap.add_argument("--prices", help="prices JSON (default trader/prices.json if it exists)")
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; its cash caps the size if it exists")
-    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--market", choices=["nse", "us"], default=None,
+                    help="nse (default) or us; or set \"market\" in trader/config.json")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",
                     help="write the proposed order (default trader/orders.json)")
     ap.add_argument("--json", action="store_true", help="print JSON instead of the report")
@@ -867,11 +999,16 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         cfg = load_config(a.config)
-        if a.weights or a.targets:
-            return run_weights(a, cfg)
-        if a.top or a.whole_shares or a.cents:
-            raise SizeError("--top, --whole-shares and --cents work with --weights or --targets")
-        return run_plan(a, cfg)
+        prev = MARKET
+        resolve_market(a, cfg)
+        try:
+            if a.weights or a.targets:
+                return run_weights(a, cfg)
+            if a.top or a.whole_shares or a.cents:
+                raise SizeError("--top, --whole-shares and --cents work with --weights or --targets")
+            return run_plan(a, cfg)
+        finally:
+            set_market(prev)
     except SizeError as e:
         print("size.py: %s" % e, file=sys.stderr)
         return 1
