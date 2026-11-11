@@ -4,12 +4,11 @@ description: >-
   Price Alerts. Rings when a price, a stop or the opening bell hits. Turns
   the trade plan into three alerts in one go (the stop, the target and "flat
   by close" at your flat-by time), plus above / below / stop / target levels,
-  percent moves from the previous close, any time of day, and the NYSE
-  opening bell, each ringing once so you are not spammed. Knows NYSE hours
-  with the 2026 and 2027 holidays and 1:00 p.m. early closes, works out New
-  York time itself, fetches free delayed quotes (Yahoo chart JSON, Stooq
-  CSV) one ticker at a time, and writes trader/prices.json for sizing and the
-  risk check. Use when the user says "alert me when", "tell me if TSLA hits",
+  percent moves from the previous close, any time of day, and the opening
+  bell, each ringing once so you are not spammed. NSE by default: 9:15 a.m.
+  to 3:30 p.m. IST, amounts in rupees, Yahoo quotes are .NS tickers
+  (RELIANCE -> RELIANCE.NS); --market us restores the NYSE version with
+  2026 and 2027 holidays and 1:00 p.m. early closes. Use when the user says "alert me when", "tell me if TSLA hits",
   "watch my stop", "watch my trade", "remind me to close by 3:55", "is the
   market open", "when does the market open", "get me a price", or right
   after /trader-exit writes a plan.
@@ -26,6 +25,24 @@ user what happened and when it is time to be flat.
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+## NSE by default
+
+This skill watches NSE first. `--market us` (or `"market": "us"` in
+`trader/config.json` for `add --from-plan`) restores the NYSE version. On NSE:
+
+- The session is 9:15 a.m. to 3:30 p.m. IST, 75 five-minute bars a day.
+  `clock` at 10:00 IST on Wed 2026-11-11 says NSE OPEN, session 09:15 to
+  15:30. Nov 10, 2026 was Diwali-Balipratipada, a holiday. NSE has no
+  1:00 p.m. early closes, and its 2027 holidays are not published yet.
+- Quotes come from Yahoo as `.NS` tickers: `quote RELIANCE` fetches
+  RELIANCE.NS (₹1335.40 on 2026-11-11, verified live). Stooq does not cover
+  NSE, so `--source stooq` is refused on NSE; use Yahoo.
+- Amounts are rupees, printed with ₹. A `below` rule at 1340 rings when
+  RELIANCE prints at or under ₹1,340.
+- The flat-by-close time alert defaults to 15:15 IST on NSE (15:55 New York
+  on NYSE). A `time` rule with `"before_close": true` never moves on NSE,
+  because NSE has no early closes.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NYSE open or closed, next open
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by close from trader/plan.json
@@ -41,7 +58,8 @@ python3 "${CLAUDE_SKILL_DIR}/alerts.py" list
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset tsla-plan-stop
 ```
 
-`--now "2026-10-19 15:55"` pins the clock (New York time); `--offline DIR`
+`--now "2026-10-19 15:55"` pins the clock (market time: IST on NSE, New York
+time with `--market us`); `--offline DIR`
 reads saved quote files instead of the network.
 
 ## What it reads and writes
@@ -61,22 +79,25 @@ reads saved quote files instead of the network.
 | `above` / `target` | price at or above `price` | after `reset`, or on its own if `"rearm": true` and the price fell back |
 | `below` / `stop` | price at or below `price` | same |
 | `pct_move` | moved `pct` percent from the previous close (or `ref`), optional `direction` up or down | once per day at most |
-| `time` | the New York clock passed `at` ("15:55") on a trading day | once per trading day |
-| `opening_bell` | the NYSE is open | once per trading day |
+| `time` | the market clock passed `at` ("15:55") on a trading day | once per trading day |
+| `opening_bell` | the market is open | once per trading day |
 
-A rule with `"date"` is watched on that New York date only; `--from-plan`
+A rule with `"date"` is watched on that market date only; `--from-plan`
 rules carry the plan's date, so yesterday's stop never rings today. A `time`
 rule with `"before_close": true` moves 3 hours earlier on a 1:00 p.m. early
-close, so "flat by close" at 15:55 rings at 12:55 on those days.
+close (NYSE only), so "flat by close" at 15:55 rings at 12:55 on those days.
+On NSE there are no early closes, so it never moves.
 
 ## Quotes
 
 - `yahoo` (default): `query2.finance.yahoo.com/v8/finance/chart/<TICKER>`, an
   unofficial free JSON endpoint, one request per ticker, half a second apart.
-  On a 429 it waits and tries once more; on a 429 or a 5xx after that it
-  tries `query1`. It identifies itself as `day-trader-skill/2.0`.
+  On NSE the ticker is the `.NS` symbol (RELIANCE -> RELIANCE.NS, M&M ->
+  M&M.NS, URL-encoded). On a 429 it waits and tries once more; on a 429 or a
+  5xx after that it tries `query1`. It identifies itself as `day-trader-skill/2.0`.
 - `stooq`: `stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv`, Stooq's free CSV.
-  It answered 404 on 2026-10-13; the parser stays for when it is back.
+  It answered 404 on 2026-10-13; the parser stays for when it is back. US
+  only: Stooq does not cover NSE tickers.
 - Free quotes are unofficial, delayed and can lag. They are fine for alerts
   and for checking a size, not for timing an order. The broker's price is the
   one that fills. Each price in `trader/prices.json` keeps its quote time, and
@@ -84,10 +105,20 @@ close, so "flat by close" at 15:55 rings at 12:55 on those days.
 - If both are down, read the price from the broker connector (Alpaca
   `get_stock_snapshot`, IBKR `get_price_snapshot`) and write it into
   `trader/prices.json` as `{"as_of": "...Z", "prices": {"TSLA": 366.48}}`.
+  On NSE, `ticket.py quote RELIANCE` reads a live Upstox quote first
+  (read only) and falls back to Yahoo.
 
-## The NYSE clock
+## The market clock
 
-Regular session 9:30 a.m. to 4:00 p.m. New York time, closed on weekends and
+NSE by default: regular session 9:15 a.m. to 3:30 p.m. IST, closed on
+weekends and on these 2026 holidays, from NSE's holiday-master
+(capital-market segment, verified 2026-11-11):
+
+- 2026: Jan 15, Jan 26, Feb 15, Mar 3, Mar 21, Mar 26, Mar 31, Apr 3, Apr 14,
+  May 1, May 28, Jun 26, Aug 15, Sep 14, Oct 2, Oct 20, Nov 8, Nov 10,
+  Nov 24, Dec 25. No early closes. 2027 holidays are not published yet.
+
+NYSE (`--market us`): regular session 9:30 a.m. to 4:00 p.m. New York time, closed on weekends and
 on these holidays, from nyse.com/markets/hours-calendars (read 2026-10-13):
 
 - 2026: Jan 1, Jan 19, Feb 16, Apr 3 (Good Friday), May 25, Jun 19, Jul 3
@@ -136,6 +167,20 @@ open, close it: trader-broker flatten --symbol TSLA builds the sell ticket, then
 
 It rings once. The next morning the plan's three alerts are no longer
 watched; with `add --opening-bell`, the bell rings at 9:30.
+
+## Example: RELIANCE on NSE (verified live 2026-11-11)
+
+A `check` at 10:00 IST on Wed 2026-11-11 with a `below` rule at 1340 reads
+the live Yahoo quote, ₹1335.40:
+
+```
+NSE OPEN (2026-11-11 10:00 IST, regular session).
+ALERT RELIANCE is ₹1335.40: at or below your alert level ₹1340.
+```
+
+A `below` rule at 1300 would not ring, and TCS at ₹2472.10 would not trip
+an `above` rule at 2500. `clock` at the same time says NSE OPEN, session
+09:15 to 15:30.
 
 ## Rules
 
