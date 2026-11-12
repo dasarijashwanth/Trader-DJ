@@ -2,7 +2,8 @@
 name: trader-exit
 description: >-
   Exit Planner. Sets your stop and your target before you enter, so you know
-  when to get out. Reads the entry from trader-entry (or a price you give),
+  when to get out. NSE first: Indian stocks, IST hours, rupee prices, `.NS`
+  tickers (RELIANCE is RELIANCE.NS on Yahoo). Reads the entry from trader-entry (or a price you give),
   puts the stop at the opening-range midpoint by default (or the range low,
   your price, a percent, or a multiple of the ATR), rounds it down to the
   cent, and sets the target at 2R (or 1R, or your price). Refuses a stop at or
@@ -11,7 +12,8 @@ description: >-
   Budget Manager and Price Alerts. Long side only. Use when the user says
   "where's my stop", "set my stop and target", "plan the exit", "when do I get
   out", "stop loss", "what's my R", "risk reward", or right after
-  /trader-entry triggers, before /trader-timemachine.
+  /trader-entry triggers, before /trader-timemachine. `--market us` restores
+  NYSE hours, dollars and plain tickers.
 argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
 ---
 
@@ -30,20 +32,38 @@ and a neat plan does not change that.
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/entry.json: midpoint stop, 2R target
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo or --offline)
-python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol TSLA --entry 364.18 --or-high 362.18 --or-low 354.47
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --entry 1335.40 --or-high 1330 --or-low 1320
 python3 "${CLAUDE_SKILL_DIR}/exit.py" show                          # the current trader/plan.json
 ```
 
-Other flags: `--flat-by 15:55`, `--json`, `--now "2026-10-19 10:15"` (New
-York time), `--entry PRICE` with a waiting entry.json to plan ahead, `--setup
+Other flags: `--flat-by 15:25`, `--json`, `--now "2026-11-11 10:00"` (market
+time), `--entry PRICE` with a waiting entry.json to plan ahead, `--setup
 level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop).
+
+## Market: NSE first
+
+- **Hours.** NSE trades 9:15 AM to 3:30 PM IST, 75 five-minute bars a
+  session. NYSE is 9:30 AM to 4:00 PM ET, 78 bars (`--market us`).
+- **Symbols and money.** A bare NSE name gets `.NS` on Yahoo: RELIANCE is
+  RELIANCE.NS, M&M is M&M.NS. Stops, targets and risk print in rupees
+  (₹1,325.00); `--market us` prints dollars.
+- **Flat by.** 15:25 IST by default on NSE (15:55 ET on NYSE), or `flat_by`
+  in the config. Out by then, win or lose, no overnight hold. On a 1:00 p.m.
+  NYSE early close it moves up to 12:55; NSE has no early closes, so it never
+  moves there.
+- **Holidays.** The NSE 2026 holiday list is built in (Diwali-Balipratipada,
+  Nov 10, 2026, is closed). NSE 2027 holidays are not published yet, so
+  weekdays in 2027 are treated as open: check nseindia.com.
+- **NSE example.** RELIANCE, entry ₹1,335.40 at 10:00 AM, opening range
+  ₹1,320.00 to ₹1,330.00: midpoint stop ₹1,325.00, 1R target ₹1,345.80,
+  risk ₹10.40 a share, flat by 15:25 IST.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
 | `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range |
-| `trader/config.json` | `flat_by` (15:55) and `min_reward_risk` (1.0: a note here, trader-risk enforces it) |
+| `trader/config.json` | `flat_by` (15:25 IST on NSE, 15:55 ET on NYSE) and `min_reward_risk` (1.0: a note here, trader-risk enforces it), plus `market` (`nse` or `us`) |
 | Yahoo chart API | only for an `atr:K` stop: the session's bars up to the entry bar, free and unofficial |
 | `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by. trader-timemachine, trader-budget and trader-alerts read it |
 
@@ -66,9 +86,10 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   below it. A risk under 0.05% of the price: too tight to survive the
   spread, normal wiggle would stop you out. An entry.json that has not
   triggered (unless you give `--entry`). A short: v2 plans longs only.
-- **Flat by.** 15:55 by default (or `flat_by` in the config). Out by then,
-  win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
-  12:55. An entry at or after the flat-by time is refused.
+- **Flat by.** 15:25 IST by default on NSE (15:55 ET on NYSE, or `flat_by`
+  in the config). Out by then, win or lose, no overnight hold. On a 1:00 p.m.
+  NYSE early close it moves up to 12:55; NSE has no early closes. An entry at
+  or after the flat-by time is refused.
 
 ## Steps
 
