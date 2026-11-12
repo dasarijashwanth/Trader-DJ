@@ -1,0 +1,179 @@
+# NSE universe (trader-scanner) - curated liquid names
+# Format: SYMBOL|Name, one a line. # = comment.
+# NSE publishes no plain symbol directory a script can fetch (its equity
+# list sits behind the site's bot check), so this is a curated list of liquid
+# NSE names: Jashwanth's 15-name watchlist first, then other liquid NSE
+# names. --symbols scans any other name on its own. To add a name, append a
+# line here and re-run `python3 scan.py universe`.
+RELIANCE|Reliance Industries
+TCS|Tata Consultancy Services
+INFY|Infosys
+HDFCBANK|HDFC Bank
+ICICIBANK|ICICI Bank
+LT|Larsen & Toubro
+TRENT|Trent
+HINDUNILVR|Hindustan Unilever
+SBIN|State Bank of India
+MARUTI|Maruti Suzuki India
+HAL|Hindustan Aeronautics
+SUNPHARMA|Sun Pharmaceutical Industries
+PIDILITIND|Pidilite Industries
+POWERGRID|Power Grid Corporation of India
+SUZLON|Suzlon Energy
+ITC|ITC
+HCLTECH|HCL Technologies
+WIPRO|Wipro
+TECHM|Tech Mahindra
+LTIM|LTIMindtree
+COFORGE|Coforge
+PERSISTENT|Persistent Systems
+MPHASIS|Mphasis
+TATAELXSI|Tata Elxsi
+KPITTECH|KPIT Technologies
+LTTS|L&T Technology Services
+KOTAKBANK|Kotak Mahindra Bank
+AXISBANK|Axis Bank
+BAJFINANCE|Bajaj Finance
+BAJAJFINSV|Bajaj Finserv
+CHOLAFIN|Cholamandalam Investment and Finance
+SHRIRAMFIN|Shriram Finance
+MUTHOOTFIN|Muthoot Finance
+MANAPPURAM|Manappuram Finance
+HDFCLIFE|HDFC Life Insurance Company
+SBILIFE|SBI Life Insurance Company
+ICICIGI|ICICI Lombard General Insurance
+ICICIPRULI|ICICI Prudential Life Insurance
+M&M|Mahindra & Mahindra
+TATAMOTORS|Tata Motors
+BAJAJ-AUTO|Bajaj Auto
+EICHERMOT|Eicher Motors
+HEROMOTOCO|Hero MotoCorp
+TVSMOTOR|TVS Motor Company
+ASHOKLEY|Ashok Leyland
+BHARATFORG|Bharat Forge
+BHARTIARTL|Bharti Airtel
+TITAN|Titan Company
+NESTLEIND|Nestle India
+DABUR|Dabur India
+MARICO|Marico
+COLPAL|Colgate-Palmolive (India)
+GODREJCP|Godrej Consumer Products
+TATACONSUM|Tata Consumer Products
+BRITANNIA|Britannia Industries
+VBL|Varun Beverages
+ASIANPAINT|Asian Paints
+BERGEPAINT|Berger Paints India
+BEL|Bharat Electronics
+NTPC|NTPC
+ONGC|Oil and Natural Gas Corporation
+COALINDIA|Coal India
+BPCL|Bharat Petroleum Corporation
+IOC|Indian Oil Corporation
+GAIL|GAIL (India)
+HPCL|Hindustan Petroleum Corporation
+OIL|Oil India
+PETRONET|Petronet LNG
+IGL|Indraprastha Gas
+MGL|Mahanagar Gas
+JSWSTEEL|JSW Steel
+TATASTEEL|Tata Steel
+HINDALCO|Hindalco Industries
+VEDL|Vedanta
+SAIL|Steel Authority of India
+NMDC|NMDC
+JINDALSTEL|Jindal Steel
+ADANIENT|Adani Enterprises
+ADANIPORTS|Adani Ports and SEZ
+ADANIGREEN|Adani Green Energy
+ADANIPOWER|Adani Power
+ADANIENSOL|Adani Energy Solutions
+ATGL|Adani Total Gas
+GRASIM|Grasim Industries
+ULTRACEMCO|UltraTech Cement
+AMBUJACEM|Ambuja Cements
+SHREECEM|Shree Cement
+SIEMENS|Siemens
+ABB|ABB India
+CUMMINSIND|Cummins India
+BHEL|Bharat Heavy Electricals
+THERMAX|Thermax
+CGPOWER|CG Power and Industrial Solutions
+POLYCAB|Polycab India
+KEI|KEI Industries
+CROMPTON|Crompton Greaves Consumer Electricals
+HAVELLS|Havells India
+VOLTAS|Voltas
+DIXON|Dixon Technologies (India)
+AMBER|Amber Enterprises India
+KAYNES|Kaynes Technology India
+DLF|DLF
+GODREJPROP|Godrej Properties
+LODHA|Macrotech Developers
+OBEROIRLTY|Oberoi Realty
+PRESTIGE|Prestige Estates Projects
+TATAPOWER|Tata Power Company
+JSWENERGY|JSW Energy
+TORNTPOWER|Torrent Power
+NHPC|NHPC
+REC|REC
+PFC|Power Finance Corporation
+IRFC|Indian Railway Finance Corporation
+HUDCO|Housing and Urban Development Corporation
+APOLLOHOSP|Apollo Hospitals Enterprise
+FORTIS|Fortis Healthcare
+MAXHEALTH|Max Healthcare Institute
+DIVISLAB|Divi's Laboratories
+DRREDDY|Dr. Reddy's Laboratories
+CIPLA|Cipla
+LUPIN|Lupin
+AUROPHARMA|Aurobindo Pharma
+BIOCON|Biocon
+TORNTPHARM|Torrent Pharmaceuticals
+ALKEM|Alkem Laboratories
+ZYDUSLIFE|Zydus Lifesciences
+LAURUSLABS|Laurus Labs
+DMART|Avenue Supermarts
+NAUKRI|Info Edge (India)
+PAYTM|One 97 Communications
+POLICYBZR|PB Fintech
+NYKAA|FSN E-Commerce Ventures
+DELHIVERY|Delhivery
+ETERNAL|Eternal
+JIOFIN|Jio Financial Services
+INDIGO|InterGlobe Aviation
+IRCTC|Indian Railway Catering and Tourism Corporation
+CONCOR|Container Corporation of India
+BANKBARODA|Bank of Baroda
+CANBK|Canara Bank
+UNIONBANK|Union Bank of India
+IDFCFIRSTB|IDFC First Bank
+FEDERALBNK|Federal Bank
+AUBANK|AU Small Finance Bank
+YESBANK|Yes Bank
+INDUSINDBK|IndusInd Bank
+PNB|Punjab National Bank
+HINDZINC|Hindustan Zinc
+NALCO|National Aluminium Company
+UPL|UPL
+PIIND|PI Industries
+SRF|SRF
+COROMANDEL|Coromandel International
+EXIDEIND|Exide Industries
+ASTRAL|Astral
+APOLLOTYRE|Apollo Tyres
+BALKRISIND|Balkrishna Industries
+CESC|CESC
+RVNL|Rail Vikas Nigam
+IRCON|Ircon International
+MAZDOCK|Mazagon Dock Shipbuilders
+COCHINSHIP|Cochin Shipyard
+BDL|Bharat Dynamics
+INOXWIND|Inox Wind
+GMRAIRPORT|GMR Airports
+JSWINFRA|JSW Infrastructure
+PAGEIND|Page Industries
+BATAINDIA|Bata India
+JUBLFOOD|Jubilant FoodWorks
+MOTHERSON|Samvardhana Motherson International
+OFSS|Oracle Financial Services Software
+MFSL|Max Financial Services
