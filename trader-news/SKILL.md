@@ -2,14 +2,16 @@
 name: trader-news
 description: >-
   News Monitor. Tracks breaking news on every stock you watch and flags what
-  moves it: Yahoo Finance headlines per ticker, each company's 8-K filings on
-  SEC EDGAR (earnings, CEO changes, deals, restatements, bankruptcy) and how
-  far each stock is from yesterday's close. Shows only what is new since the
-  last check, newest first, in New York time, tags each item (earnings,
-  analyst, deal, halt, regulatory, macro...) and never repeats one. Use when
-  the user says "any news on TSLA", "why is this moving", "what's the news on
-  my watchlist", "morning briefing", "pre-market news", "monitor the news",
-  "did anything break", "check the 8-Ks", or after /trader-scanner finds setups.
+  moves it: headlines per ticker, each company's filings (8-K on SEC EDGAR
+  for US stocks; NSE corporate announcements for Indian stocks) and how far
+  each stock is from yesterday's close. Shows only what is new since the
+  last check, newest first, in market time (IST for NSE, ET for NYSE), tags
+  each item (earnings, analyst, deal, halt, regulatory, macro...) and never
+  repeats one. NSE is the default market (--market us for NYSE). Use when
+  the user says "any news on RELIANCE", "why is this moving", "what's the
+  news on my watchlist", "morning briefing", "pre-market news", "monitor
+  the news", "did anything break", "check the 8-Ks", or after
+  /trader-scanner finds setups.
 argument-hint: "[tickers]"
 ---
 
@@ -25,9 +27,13 @@ Tool in this folder (standard library Python, no keys):
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
-python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers TSLA NVDA --hours 12
+python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers TSLA NVDA --hours 12 --market us
+python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE TCS --market nse
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 ```
+
+NSE is the default market (`--market` defaults to nse, or set `"market"` in
+`trader/config.json`). `--market us` restores the NYSE behaviour below.
 
 ## What it reads and writes
 
@@ -36,9 +42,11 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 | `--tickers`, else `trader/watchlist.json` | the scanner's hits (trader-scanner) |
 | `trader/plan.json` | the trade you are planning (trader-exit) |
 | `trader/portfolio.json` | what you hold (trader-broker records fills there) |
-| Yahoo Finance headline RSS | `https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US` |
-| Yahoo Finance chart endpoint | the last price against yesterday's close (unofficial, can lag) |
-| SEC EDGAR company Atom feed | 8-K by default (`--forms 8-K,10-Q` for more); needs `sec_user_agent` in `trader/config.json` or `SEC_USER_AGENT`, else filings are skipped with a note |
+| Yahoo Finance headline RSS (US) | `https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US` |
+| Yahoo Finance chart endpoint | the last price against yesterday's close (unofficial, can lag); works for `.NS` tickers too |
+| SEC EDGAR company Atom feed (US) | 8-K by default (`--forms 8-K,10-Q` for more); needs `sec_user_agent` in `trader/config.json` or `SEC_USER_AGENT`, else filings are skipped with a note |
+| Google News RSS (NSE) | headlines: `https://news.google.com/rss/search?q=RELIANCE.NS+stock&hl=en-IN&gl=IN&ceid=IN:en` (Yahoo's headline RSS is empty for `.NS` tickers, so it is not used for NSE) |
+| NSE corporate announcements (NSE) | the Indian 8-K equivalent: `https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=RELIANCE` (results, board meetings, insider-trading disclosures, credit ratings). NSE's site 403s intermittently behind its bot check; the tool retries once with a fresh session and says so plainly, with the announcements page URL, instead of faking anything |
 | `trader/state/news.json` | what has been shown (kept 30 days) and each ticker's CIK |
 
 ## The rules
@@ -47,7 +55,8 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
   happened, open the story or the filing and read it. Quote the source and
   link it. Never summarise a paywalled story you could not read: say so.
 - **Filings beat headlines.** If an 8-K and a headline disagree, the 8-K is
-  what the company told the SEC.
+  what the company told the SEC. For NSE stocks the same holds for an NSE
+  announcement: it is what the company told the exchange.
 - **Say what it touches.** Every item lists the tickers it touches and its
   tags: earnings, analyst, legal, deal, capital, people, risk, halt,
   regulatory, macro. Filings marked `!` carry an important 8-K item: earnings
@@ -75,6 +84,16 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 
 During the session: `/loop 15m /trader-news`, or a scheduled task each
 morning before the open.
+
+## Example: NSE
+
+`news.py --tickers RELIANCE --market nse --hours 240` (run 2026-11-11):
+`RELIANCE 1,335.40 +0.83% vs yesterday's close 1,324.40 at 15:29 IST`, then
+Google News headlines plus NSE announcements, newest first: the Nov 6
+announcement that Reliance executives will meet investors at the CLSA India
+Forum on Nov 16, and the Nov 4 credit-rating announcement, each with its PDF
+link on nseindia.com. Financial Result Updates are tagged earnings and marked
+`!`, like an earnings 8-K.
 
 ## Example: the reel
 
