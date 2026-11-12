@@ -7,10 +7,14 @@ description: >-
   filing, and turns each PDF into clean rows (who, owner, stock, ticker,
   buy or sell, options strike and expiry, trade date, amount range, how many
   days it took to disclose). Flags trades in stocks you hold. Senate reports
-  are covered by a documented manual route. Use when the user says "what is
+  are covered by a documented manual route. For Indian stocks there is no
+  Congress equivalent, so `ptr.py nse` reads the closest Indian public
+  disclosures instead: NSE insider-trading disclosures, promoter pledge
+  data, FII/DII flows and bulk/block deals. Use when the user says "what is
   Pelosi buying", "track Nancy Pelosi", "Congress trades", "politician stock
-  trades", "did any congressman buy X", "alert me when Pelosi files", or
-  "run the Pelosi skill".
+  trades", "did any congressman buy X", "alert me when Pelosi files",
+  "run the Pelosi skill", "any insider trading in RELIANCE", or "FII DII
+  flows today".
 argument-hint: "[member name] [--read]"
 ---
 
@@ -56,6 +60,40 @@ python3 "${CLAUDE_SKILL_DIR}/ptr.py" --help
 - **Options are options.** A call bought with a strike and an expiry is not
   a share purchase. The tool reads contracts, strike and expiry from the
   description and marks exercises.
+
+## The NSE command (Indian stocks)
+
+There is no Indian equivalent of a Congress PTR: no politician's trades are
+published this way. The closest public disclosures are NSE's own:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/ptr.py" nse --tickers RELIANCE
+python3 "${CLAUDE_SKILL_DIR}/ptr.py" nse --tickers RELIANCE TCS --days 365 --json
+```
+
+For each ticker it prints, newest first:
+
+- **Insider-trading disclosures**: NSE corporate announcements in the
+  "Disclosure under Insider Trading Regulation" category (SEBI PIT
+  Regulations, Reg. 7(2)), with date, text and PDF link. RELIANCE has 73
+  of these in the NSE slice, the newest from 2015-06-26, so `--days 90`
+  usually finds none: that is what the exchange returned, not a gap in the
+  tool. Two nearby categories ("Discl. under SEBI Insider Trading and
+  Takeover Regulation", "Reg.13-SEBI (Prohibition of Insider Trading
+  Regulations) 1992") are not counted.
+- **Promoter pledge**: shares pledged and promoter holding % from NSE's
+  corporate-shareholdings API. Best effort: the endpoint 404/403s from this
+  machine, so when it fails the tool says so plainly and points at the
+  shareholding pattern on nseindia.com instead of inventing numbers.
+- **FII/DII flows**: the day's net buying in Rs Crores (Nov 11, 2026: DII
+  -8,434.53, FII/FPI +12,563.33).
+- **Bulk/block deals**: best effort over the known endpoints; all of them
+  404/403 from this machine, so a failure prints the NSE bulk/block deals
+  page URL (`https://www.nseindia.com/market-data/bulk-block-deals`)
+  instead of fake rows.
+
+The same caveats as PTRs apply: these are public disclosures filed after
+the trade. A disclosure is a reason to look at a chart, not a setup.
 
 ## Step 1: what has been filed
 

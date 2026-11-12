@@ -5,6 +5,7 @@ Reads the House Clerk's public financial disclosure index and the Periodic
 Transaction Reports (PTRs) members of the House file when they, their spouse
 or a dependent child buy or sell a stock.
 
+    python3 ptr.py nse --tickers RELIANCE            # NSE: insider disclosures, pledge, FII/DII
     python3 ptr.py index --member pelosi                 # this year's PTRs by a member
     python3 ptr.py index --year 2026 --since 2026-10-01  # every PTR filed since a date
     python3 ptr.py new --member pelosi                   # only what is new since last check
@@ -40,7 +41,9 @@ import re
 import shutil
 import subprocess
 import sys
+import http.cookiejar
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -61,6 +64,314 @@ LATE_DAYS = 45
 
 class PtrError(Exception):
     pass
+
+# ---------------------------------------------------------------- market (NSE first at the CLI; --market us restores NYSE)
+# The module default is "us": the original NYSE behaviour, so direct callers
+# and the offline tests see exactly what they saw before. main() sets the
+# market from --market (default nse) or trader/config.json "market".
+MARKET = "us"
+
+NSE_HOLIDAYS = {  # NSE capital-market holidays 2026, from NSE holiday-master (CM segment).
+    "2026-01-15": "Municipal Corporation Election - Maharashtra",
+    "2026-01-26": "Republic Day",
+    "2026-02-15": "Mahashivratri",
+    "2026-03-03": "Holi",
+    "2026-03-21": "Id-Ul-Fitr (Ramadan Eid)",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-08-15": "Independence Day",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-08": "Diwali Laxmi Pujan",
+    "2026-11-10": "Diwali-Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# NSE has no 1:00 p.m. early closes. Diwali's Muhurat session is a separate
+# evening session (about an hour, announced by circular); these tools treat
+# that day as closed for the day session. NSE's 2027 holidays are not
+# published yet (expected December 2026): years outside the list above are
+# treated as open on weekdays, so confirm them on nseindia.com.
+NSE_EARLY_CLOSE = {}
+NYSE_HOLIDAYS = {
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King, Jr. Day",
+    "2026-02-16": "Washington's Birthday",
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",
+    "2026-06-19": "Juneteenth National Independence Day",
+    "2026-07-03": "Independence Day (observed)",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving Day",
+    "2026-12-25": "Christmas Day",
+    "2027-01-01": "New Year's Day",
+    "2027-01-18": "Martin Luther King, Jr. Day",
+    "2027-02-15": "Washington's Birthday",
+    "2027-03-26": "Good Friday",
+    "2027-05-31": "Memorial Day",
+    "2027-06-18": "Juneteenth National Independence Day (observed)",
+    "2027-07-05": "Independence Day (observed)",
+    "2027-09-06": "Labor Day",
+    "2027-11-25": "Thanksgiving Day",
+    "2027-12-24": "Christmas Day (observed)",
+}
+NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
+    "2026-11-27": "day after Thanksgiving",
+    "2026-12-24": "Christmas Eve",
+    "2027-11-26": "day after Thanksgiving",
+}
+
+MARKETS = {
+    "nse": {"tz": "IST", "open": _dt.time(9, 15), "close": _dt.time(15, 30),
+            "early": None, "holidays": NSE_HOLIDAYS, "early_close": NSE_EARLY_CLOSE,
+            "currency": "\u20b9", "exchange": "NSE", "bars_per_day": 75},
+    "us": {"tz": "ET", "open": _dt.time(9, 30), "close": _dt.time(16, 0),
+           "early": _dt.time(13, 0), "holidays": NYSE_HOLIDAYS, "early_close": NYSE_EARLY_CLOSE,
+           "currency": "$", "exchange": "NYSE", "bars_per_day": 78},
+}
+
+
+def set_market(name):
+    """Switch the active market: 'nse' or 'us'. Raises PtrError otherwise."""
+    global MARKET
+    name = (name or "nse").lower()
+    if name not in MARKETS:
+        raise PtrError("--market wants nse or us, got %r" % name)
+    MARKET = name
+
+
+def mkt():
+    return MARKETS[MARKET]
+
+
+def tz_label():
+    return mkt()["tz"]
+
+
+def resolve_market(args, cfg=None):
+    """CLI/config market selection: --market wins, then trader/config.json
+    'market', then nse. Call before any market-aware work."""
+    name = getattr(args, "market", None)
+    if not name and cfg:
+        name = cfg.get("market")
+    set_market(name or "nse")
+
+
+# ---------------------------------------------------------------- NSE: the Indian equivalent
+# US Congress disclosures have no Indian equivalent: no politician's trades
+# are published like PTRs. The closest Indian public disclosures are the
+# ones this tool reads for `ptr.py nse`:
+#   - NSE corporate announcements filtered to "Disclosure under Insider
+#     Trading Regulation" (promoter / insider trades, SEBI PIT Regulations)
+#   - NSE promoter pledge / shareholding data (best effort: the endpoint
+#     404/403s from here, so a failure is reported honestly, never faked)
+#   - NSE FII/DII daily flows (foreign vs domestic institutional net buying)
+#   - NSE bulk/block deals (best effort: all three endpoints 404/403 from
+#     here; on failure the tool prints the NSE page URL instead of rows)
+# Nothing here is inside information: all of it is public, and insider
+# disclosures arrive after the trade, like PTRs.
+NSE_CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+NSE_BASE = "https://www.nseindia.com"
+NSE_ANNOUNCE_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=%s"
+NSE_ANNOUNCE_PAGE = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+NSE_FIIDII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
+NSE_PLEDGE_URL = ("https://www.nseindia.com/api/corporate-shareholdings"
+                  "?index=equities&symbol=%s")
+NSE_BULK_URLS = ("https://www.nseindia.com/api/live-analysis-bulk-deals",
+                 "https://www.nseindia.com/api/bulk-block-deals",
+                 "https://www.nseindia.com/api/bulk-deals")
+NSE_BULK_PAGE = "https://www.nseindia.com/market-data/bulk-block-deals"
+
+
+def nse_get_json(url, offline_path=None):
+    """GET an NSE JSON API with a cookied session (home first, ignored on
+    failure; Chrome UA + Referer; one retry with a fresh session on 403/401).
+    offline_path reads a saved file instead. Raises PtrError on failure;
+    never returns fake data."""
+    if offline_path is not None:
+        if not os.path.isfile(offline_path):
+            raise PtrError("offline: no file %s" % offline_path)
+        with open(offline_path, encoding="utf-8") as fh:
+            return json.load(fh)
+    last = None
+    for _ in range(2):
+        cj = http.cookiejar.CookieJar()
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        try:
+            try:
+                req = urllib.request.Request(NSE_BASE + "/", headers={"User-Agent": NSE_CHROME_UA})
+                op.open(req, timeout=30).read()
+            except Exception:
+                pass  # the home page itself 403s from here; the API often still answers
+            req = urllib.request.Request(url, headers={
+                "User-Agent": NSE_CHROME_UA, "Referer": NSE_BASE + "/",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9"})
+            with op.open(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last = PtrError("NSE answered HTTP %d for %s" % (e.code, url.split("?")[0]))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            last = PtrError("could not read NSE %s: %s" % (url.split("?")[0], e))
+    raise last
+
+
+def _nse_iso_date(value):
+    """'31-May-2013 16:52:02' -> '2013-05-31' (ISO, so cutoffs sort right)."""
+    try:
+        return _dt.datetime.strptime((value or "").strip(), "%d-%b-%Y %H:%M:%S").date().isoformat()
+    except ValueError:
+        return None
+
+
+def parse_nse_announcements(data, symbol):
+    """NSE corporate-announcements JSON -> [{date, category, text, link, ...}]."""
+    out = []
+    for a in data if isinstance(data, list) else []:
+        out.append({"date": _nse_iso_date(a.get("an_dt") or a.get("sort_date")),
+                    "category": (a.get("desc") or "").strip(),
+                    "text": " ".join((a.get("attchmntText") or "").split()),
+                    "link": a.get("attchmntFile") or NSE_ANNOUNCE_PAGE,
+                    "xbrl": bool(a.get("hasXbrl")), "isin": a.get("sm_isin"),
+                    "symbol": symbol})
+    return out
+
+
+def insider_disclosures(items):
+    """Announcements that are insider-trading disclosures (SEBI PIT Reg. 7(2))."""
+    return [a for a in items
+            if a["category"] == "Disclosure under Insider Trading Regulation"]
+
+
+def parse_fiidi(data):
+    """FII/DII JSON list -> {'date', 'dii_net', 'fii_net'} in Rs Crores."""
+    out = {"date": None, "dii_net": None, "fii_net": None}
+    for row in data if isinstance(data, list) else []:
+        cat = (row.get("category") or "")
+        try:
+            net = float(row.get("netValue"))
+        except (TypeError, ValueError):
+            continue
+        out["date"] = out["date"] or row.get("date")
+        if cat == "DII":
+            out["dii_net"] = net
+        elif cat.startswith("FII"):
+            out["fii_net"] = net
+    return out
+
+
+def _walk_numbers(obj, words, found):
+    """Recursively collect numbers whose key contains any of `words`."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if any(w in lk for w in words) and isinstance(v, (int, float)):
+                found.setdefault(lk, v)
+            _walk_numbers(v, words, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_numbers(v, words, found)
+
+
+def parse_pledge(data):
+    """Promoter pledge numbers from NSE's shareholdings payload. The payload
+    shape varies and the endpoint is flaky from here, so this looks for any
+    likely key ('pledge', 'promoter' + 'holding'/'percent') instead of
+    assuming one shape; missing numbers come back None, never invented."""
+    found = {}
+    _walk_numbers(data, ("pledge",), found)
+    pledged = None
+    for k, v in found.items():
+        if "share" in k or "no" in k or "qty" in k or "quantity" in k:
+            pledged = v
+            break
+    if pledged is None and found:
+        pledged = next(iter(found.values()))
+    hold = {}
+    _walk_numbers(data, ("promoter",), hold)
+    pct = None
+    for k, v in hold.items():
+        if "percent" in k or "holding" in k or "%" in k:
+            pct = v
+            break
+    return {"pledged_shares": int(pledged) if pledged is not None else None,
+            "promoter_holding_pct": float(pct) if pct is not None else None}
+
+
+def fetch_nse_bulk_deals(offline=None):
+    """Bulk/block deals, best effort: tries each known endpoint once. Returns
+    (rows, error): rows is a list (possibly empty), error a plain message."""
+    if offline:
+        path = os.path.join(offline, "nse-bulk-deals.json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh), None
+    last = None
+    for url in NSE_BULK_URLS:
+        try:
+            data = nse_get_json(url)
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("bulkDeals") or []
+            return list(data) if isinstance(data, list) else [], None
+        except PtrError as exc:
+            last = str(exc)
+    return [], ("NSE bulk/block deals could not be read from this machine (%s). "
+                "See %s" % (last, NSE_BULK_PAGE))
+
+
+def render_nse(symbol, disclosures, pledge, pledge_error, fiidi, bulk, bulk_error):
+    """Plain-text report for `ptr.py nse --tickers SYM`."""
+    out = ["NSE disclosures for %s (public filings, not inside information)." % symbol, ""]
+    out.append("Insider-trading disclosures (NSE announcements, SEBI PIT Regulations): %d"
+               % len(disclosures))
+    for d in disclosures[:10]:
+        out.append("  - %s  %s" % (d["date"], (d["text"] or d["category"])[:160]))
+        out.append("      %s" % d["link"])
+    if len(disclosures) > 10:
+        out.append("  ... and %d more (see %s)" % (len(disclosures) - 10, NSE_ANNOUNCE_PAGE))
+    if not disclosures:
+        out.append("  none found in the announcements returned.")
+    out.append("")
+    if pledge_error:
+        out.append("Promoter pledge: %s" % pledge_error)
+    elif pledge.get("pledged_shares") is not None or pledge.get("promoter_holding_pct") is not None:
+        bits = []
+        if pledge.get("pledged_shares") is not None:
+            bits.append("%s shares pledged" % "{:,}".format(pledge["pledged_shares"]))
+        if pledge.get("promoter_holding_pct") is not None:
+            bits.append("promoter holding %.2f%%" % pledge["promoter_holding_pct"])
+        out.append("Promoter pledge: " + ", ".join(bits) + ".")
+    else:
+        out.append("Promoter pledge: NSE returned no pledge numbers for %s." % symbol)
+    out.append("")
+    if fiidi.get("date"):
+        out.append("FII/DII flows, %s (Rs Crores, net): DII %s, FII/FPI %s."
+                   % (fiidi["date"],
+                      "%+.2f" % fiidi["dii_net"] if fiidi.get("dii_net") is not None else "n/a",
+                      "%+.2f" % fiidi["fii_net"] if fiidi.get("fii_net") is not None else "n/a"))
+    else:
+        out.append("FII/DII flows: not available.")
+    out.append("")
+    if bulk_error:
+        out.append("Bulk/block deals: %s" % bulk_error)
+    elif bulk:
+        out.append("Bulk/block deals: %d rows." % len(bulk))
+        for row in bulk[:10]:
+            out.append("  - %s" % row)
+    else:
+        out.append("Bulk/block deals: no rows returned.")
+    out.append("")
+    out.append("These are public disclosures filed after the trades. Amounts and "
+               "dates come from NSE; a disclosure is a reason to look at a chart, "
+               "not a setup.")
+    return "\n".join(out) + "\n"
 
 
 # ---------------------------------------------------------------- the index
@@ -410,6 +721,8 @@ def render_index(rows):
 
 def _parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--market", choices=["nse", "us"], default=None,
+                    help="nse (default for the nse command) or us")
     sub = ap.add_subparsers(dest="cmd")
     year = _dt.date.today().year
 
@@ -446,6 +759,19 @@ def _parser():
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("nse", help="Indian equivalent: NSE insider disclosures, "
+                           "promoter pledge, FII/DII flows, bulk/block deals")
+    p.add_argument("--tickers", nargs="*", required=True, help="NSE symbols, e.g. RELIANCE TCS")
+    p.add_argument("--days", type=int, default=90,
+                   help="only disclosures from the last N days (default 90; 0 = all)")
+    p.add_argument("--offline", metavar="DIR",
+                   help="saved nse-ann-<SYM>.json, nse-fiidii.json, nse-pledge-<SYM>.json, "
+                        "nse-bulk-deals.json")
+    p.add_argument("--no-pledge", action="store_true", help="skip the promoter pledge lookup")
+    p.add_argument("--no-fiidii", action="store_true", help="skip the FII/DII flows")
+    p.add_argument("--no-bulk", action="store_true", help="skip the bulk/block deals lookup")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("parse", help="rows from pdftotext -layout text of a PTR")
     p.add_argument("text_file")
     p.add_argument("--filed", help="filing date YYYY-MM-DD (else read from the signature)")
@@ -478,14 +804,81 @@ def main(argv=None):
     if not args.cmd:
         _parser().print_help()
         return 2
+    prev_market = MARKET
     try:
+        if args.cmd == "nse":
+            set_market("nse")
+        elif getattr(args, "market", None):
+            set_market(args.market)
         return _run(args)
     except (PtrError, OSError) as exc:
         print("ptr: %s" % exc, file=sys.stderr)
         return 2
+    finally:
+        set_market(prev_market)
+
+
+def _run_nse(args):
+    """`ptr.py nse --tickers RELIANCE`: the Indian disclosures for one or more
+    NSE names. FII/DII flows and bulk deals are market-wide, fetched once."""
+    tickers = [t.upper() for t in args.tickers]
+    fiidi, fiidi_error = {"date": None, "dii_net": None, "fii_net": None}, None
+    if not args.no_fiidii:
+        try:
+            path = os.path.join(args.offline, "nse-fiidii.json") if args.offline else None
+            fiidi = parse_fiidi(nse_get_json(NSE_FIIDII_URL, offline_path=path))
+        except PtrError as exc:
+            fiidi_error = str(exc)
+    bulk, bulk_error = [], None
+    if not args.no_bulk:
+        bulk, bulk_error = fetch_nse_bulk_deals(args.offline)
+    cutoff = (_dt.date.today() - _dt.timedelta(days=args.days)).isoformat() if args.days else None
+    results, failed = [], 0
+    for sym in tickers:
+        try:
+            path = os.path.join(args.offline, "nse-ann-%s.json" % sym) if args.offline else None
+            items = parse_nse_announcements(
+                nse_get_json(NSE_ANNOUNCE_URL % urllib.parse.quote(sym), offline_path=path), sym)
+        except PtrError as exc:
+            print("ptr: NSE announcements for %s: %s. See %s" % (sym, exc, NSE_ANNOUNCE_PAGE),
+                  file=sys.stderr)
+            failed += 1
+            continue
+        disc = insider_disclosures(items)
+        disc.sort(key=lambda d: d["date"] or "", reverse=True)  # API order is not date order
+        if cutoff:
+            disc = [d for d in disc if (d["date"] or "") >= cutoff]
+        pledge, pledge_error = {"pledged_shares": None, "promoter_holding_pct": None}, None
+        if not args.no_pledge:
+            try:
+                ppath = os.path.join(args.offline, "nse-pledge-%s.json" % sym) if args.offline else None
+                pledge = parse_pledge(
+                    nse_get_json(NSE_PLEDGE_URL % urllib.parse.quote(sym), offline_path=ppath))
+            except PtrError as exc:
+                pledge_error = ("NSE pledge data for %s could not be read from this machine (%s); "
+                                "check the shareholding pattern for %s on nseindia.com"
+                                % (sym, exc, sym))
+        results.append({"symbol": sym, "disclosures": disc, "pledge": pledge,
+                        "pledge_error": pledge_error, "fiidi": fiidi,
+                        "fiidi_error": fiidi_error, "bulk": bulk, "bulk_error": bulk_error})
+        if not args.json:
+            sys.stdout.write(render_nse(sym, disc, pledge, pledge_error, fiidi, bulk, bulk_error))
+    if fiidi_error:
+        print("ptr: FII/DII flows: %s" % fiidi_error, file=sys.stderr)
+    if args.json:
+        print(json.dumps(results, indent=2))
+    return 0 if results and not failed else (1 if results else 2)
 
 
 def _run(args):
+    if args.cmd == "nse":
+        return _run_nse(args)
+    if MARKET == "nse":
+        # House PTRs have no Indian equivalent; the nse command is the route.
+        print("ptr: House PTRs cover the US Congress only. For Indian disclosures use "
+              "`ptr.py nse --tickers RELIANCE` (or --market us for the House).",
+              file=sys.stderr)
+        return 2
     if args.cmd == "parse":
         with open(args.text_file, encoding="utf-8", errors="replace") as fh:
             report = parse_ptr_text(fh.read(), filed=args.filed)
